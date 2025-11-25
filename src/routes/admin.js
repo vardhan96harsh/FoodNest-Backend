@@ -1,14 +1,25 @@
 // src/routes/admin.js
 import express from "express";
+import { ROLE_ENUM, User } from "../models/User.js";
 import { auth, requireRole } from "../middleware/auth.js";
 import { RegistrationRequest } from "../models/RegistrationRequest.js";
-import User from "../models/User.js"; // default export in your project
+// import User from "../models/User.js"; // default export in your project
 import { encryptJson, decryptJson, maskAccountNumber } from "../utils/crypto.js";
 import bcrypt from "bcryptjs";
 import { sendApprovalEmail , sendDeclinedEmail } from "../utils/mailer.js";
 import { Team } from "../models/Team.js";
 
 const router = express.Router();
+
+function pickUserFields(body = {}) {
+  return {
+    email: body.email?.trim().toLowerCase(),
+    name: body.name?.trim(),
+    role: body.role?.trim(),
+    password: body.password,
+    disabled: typeof body.disabled === "boolean" ? body.disabled : undefined,
+  };
+}
 
 // Normalize incoming fields (accept case/hyphen variants)
 function normalizeUserPayload(input = {}) {
@@ -96,9 +107,105 @@ function normalizeUserPayload(input = {}) {
   return out;
 }
 
+router.post("/users", auth, requireRole("superadmin"), async (req, res) => {
+  try {
+    const { email, name, role, password, disabled } = pickUserFields(req.body);
+    if (!email || !name || !role || !password)
+      return res.status(400).json({ error: "email, name, role, password are required" });
+    if (!ROLE_ENUM.includes(role))
+      return res.status(400).json({ error: `role must be one of: ${ROLE_ENUM.join(", ")}` });
+
+    const exists = await User.findOne({ email }).lean();
+    if (exists) return res.status(409).json({ error: "Email already exists" });
+
+    const user = new User({ email, name, role, disabled: !!disabled, passwordHash: "temp" });
+    await user.setPassword(password); // hashes
+    await user.save();
+
+    res.status(201).json({ user: { _id: user._id, email, name, role, disabled: user.disabled } });
+  } catch (e) {
+    console.error("Create user error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// LIST users
+router.get("/users", auth, requireRole("superadmin"), async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.role) filter.role = req.query.role;
+    const users = await User.find(filter)
+      .select("_id name email role disabled createdAt")
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ users });
+  } catch (e) {
+    console.error("List users error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// UPDATE user (name/role/disabled/password)
+router.patch("/users/:id", auth, requireRole("superadmin"), async (req, res) => {
+  try {
+    const { name, role, password, disabled } = pickUserFields(req.body);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // safety: don't demote the last superadmin
+    const isDemotingLastSuperadmin =
+      user.role === "superadmin" &&
+      role && role !== "superadmin" &&
+      (await User.countDocuments({ role: "superadmin", _id: { $ne: user._id } })) === 0;
+    if (isDemotingLastSuperadmin)
+      return res.status(400).json({ error: "Cannot demote the last superadmin" });
+
+    if (name) user.name = name;
+    if (role) {
+      if (!ROLE_ENUM.includes(role))
+        return res.status(400).json({ error: `role must be one of: ${ROLE_ENUM.join(", ")}` });
+      user.role = role;
+    }
+    if (typeof disabled === "boolean") user.disabled = disabled;
+    if (password) await user.setPassword(password);
+
+    await user.save();
+    res.json({ user: { _id: user._id, email: user.email, name: user.name, role: user.role, disabled: user.disabled } });
+  } catch (e) {
+    console.error("Update user error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE user (safety: can’t delete the last superadmin)
+router.delete("/users/:id", auth, requireRole("superadmin"), async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (user.role === "superadmin") {
+      const others = await User.countDocuments({ role: "superadmin", _id: { $ne: user._id } });
+      if (others === 0) return res.status(400).json({ error: "Cannot delete the last superadmin" });
+    }
+
+    await user.deleteOne();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Delete user error:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+
 /* -------------------------------------------
    Registration Requests (you already had these)
 -------------------------------------------- */
+
+/* -----------------------------
+   Users (for SuperAdmin screens)
+------------------------------ */
+
 
 /** GET /api/admin/requests/count - get count of pending requests for notification */
 router.get("/requests/count", auth, requireRole("superadmin"), async (req, res) => {
@@ -184,250 +291,8 @@ router.post("/requests/:id/decline", auth, requireRole("superadmin"), async (req
 });
 
 
-/* -----------------------------
-   Users (for SuperAdmin screens)
------------------------------- */
-
-/** GET /api/admin/users  — list all users (superadmin only) */
-router.get("/users", auth, requireRole("superadmin", "supervisor"), async (req, res) => {
-  try {
-    // Exclude passwordHash if present
-    const q = {};
-       if (req.query.role) q.role = req.query.role; // 'rider' | 'cook' | 'supervisor' | 'refill' | 'superadmin'
-       const users = await User.find(q, { passwordHash: 0 }).sort({ createdAt: -1 }).lean();
-
-    const items = users.map((u) => ({
-      id: String(u._id),
-      name: u.name,
-      email: u.email,
-      role: u.role,                                // "superadmin" | "rider" | "cook" | "supervisor" | "refill"
-      status: u?.disabled ? "Inactive" : "Active", // if you don't use `disabled`, this will resolve to Active
-      createdAt: u.createdAt,
-    }));
-
-    res.json({ items });
-  } catch (err) {
-    console.error("List users error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-/** GET /api/admin/users/:id — get full user details */
-router.get("/users/:id", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id, { passwordHash: 0 }).lean();
-    if (!user) return res.status(404).json({ error: "Not found" });
-    const bank = decryptJson(user.bankEnc);
-    res.json({
-      id: String(user._id),
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      status: user?.disabled ? "Inactive" : "Active",
-      currency: user.currency,
-      baseSalary: user.baseSalary,
-      payFrequency: user.payFrequency,
-      employmentType: user.employmentType,
-      vat: user.vat,
-      effectiveFrom: user.effectiveFrom,
-      otEligible: user.otEligible,
-      otRate: user.otRate,
-      allowances: user.allowances,
-      deductions: user.deductions,
-      taxId: user.taxId,
-      bank,
-      notes: user.notes,
-    });
-  } catch (err) {
-    console.error("Get user error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-/** PATCH /api/admin/users/:id — update basic fields and payroll */
-router.patch("/users/:id", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    const ALLOW = [
-      "name",
-      "email",
-      "role",
-      "disabled",
-      // payroll/salary fields
-      "currency",
-      "baseSalary",
-      "payFrequency",
-      "employmentType",
-      "vat",
-      "effectiveFrom",
-      "otEligible",
-      "otRate",
-      "allowances",
-      "deductions",
-      "taxId",
-      "bank",
-      "notes",
-    ];
-    const updates = {};
-    for (const k of ALLOW) if (k in req.body) updates[k] = req.body[k];
-    const normalized = normalizeUserPayload(updates);
-    // Move bank to bankEnc if present
-    const { bank, ...rest } = normalized;
-    if (bank) {
-      rest.bankEnc = encryptJson(bank);
-    }
-
-    // Optional: very light role validation
-    const ROLES = new Set(["superadmin", "rider", "cook", "supervisor", "refill"]);
-    if ("role" in updates && !ROLES.has(updates.role)) {
-      return res.status(400).json({ error: "Invalid role" });
-    }
-
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      rest,
-      { new: true, runValidators: true, projection: { passwordHash: 0 } }
-    ).lean();
-
-    if (!user) return res.status(404).json({ error: "Not found" });
-
-    res.json({
-      ok: true,
-      user: {
-        id: String(user._id),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        status: user?.disabled ? "Inactive" : "Active",
-        // echo payroll fields back
-        currency: user.currency,
-        baseSalary: user.baseSalary,
-        payFrequency: user.payFrequency,
-        employmentType: user.employmentType,
-        vat: user.vat,
-        effectiveFrom: user.effectiveFrom,
-        otEligible: user.otEligible,
-        otRate: user.otRate,
-        allowances: user.allowances,
-        deductions: user.deductions,
-        taxId: user.taxId,
-        bank: decryptJson(user.bankEnc),
-        notes: user.notes,
-      },
-    });
-  } catch (err) {
-    console.error("Update user error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-/** DELETE /api/admin/users/:id — remove a user (but not superadmin) */
-router.delete("/users/:id", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ error: "Not found" });
-
-    if (user.role === "superadmin") {
-      return res.status(400).json({ error: "Cannot delete superadmin" });
-    }
-
-    await user.deleteOne();
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Delete user error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-
-router.post("/users", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    const {
-      name,
-      email,
-      role,
-      password,
-      currency,
-      baseSalary,
-      payFrequency,
-      employmentType,
-      vat,
-      effectiveFrom,
-      otEligible,
-      otRate,
-      allowances,
-      deductions,
-      taxId,
-      bank,
-      notes,
-    } = req.body;
-    if (!name || !email || !role || !password) {
-      return res.status(400).json({ error: "name, email, role, password required" });
-    }
-
-    const ROLES = new Set(["superadmin", "rider", "cook", "supervisor", "refill"]);
-    if (!ROLES.has(role)) return res.status(400).json({ error: "Invalid role" });
-
-    const exists = await User.findOne({ email });
-    if (exists) return res.status(409).json({ error: "Email already in use" });
-
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    const payroll = normalizeUserPayload({
-      currency,
-      baseSalary,
-      payFrequency,
-      employmentType,
-      vat,
-      effectiveFrom,
-      otEligible,
-      otRate,
-      allowances,
-      deductions,
-      taxId,
-      bank,
-      notes,
-    });
-
-    // Remove undefined keys to avoid overwriting defaults
-    Object.keys(payroll).forEach((k) => payroll[k] === undefined && delete payroll[k]);
-
-    const { bank: bankPlain, ...rest } = payroll;
-    const user = await User.create({ name, email, role, passwordHash, ...rest, bankEnc: bankPlain ? encryptJson(bankPlain) : undefined });
-
-    res.status(201).json({
-      ok: true,
-      user: {
-        id: String(user._id),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        status: user.disabled ? "Inactive" : "Active",
-        currency: user.currency,
-        baseSalary: user.baseSalary,
-        payFrequency: user.payFrequency,
-        employmentType: user.employmentType,
-        vat: user.vat,
-        effectiveFrom: user.effectiveFrom,
-        otEligible: user.otEligible,
-        otRate: user.otRate,
-        allowances: user.allowances,
-        deductions: user.deductions,
-        taxId: user.taxId,
-        bank: decryptJson(user.bankEnc),
-        notes: user.notes,
-      },
-    });
-  } catch (err) {
-    console.error("Create user error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-
-
-
 //Team management 
+
 
 /** GET /api/admin/teams — list teams (populated members) */
 router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {

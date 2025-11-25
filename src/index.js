@@ -19,6 +19,9 @@ import prepRequestsRoutes from "./routes/prepRequests.js";
 import { auth } from "./middleware/auth.js";
 import combosRoutes from "./routes/combos.js";
 
+import vehicleRoutes from "./routes/vehicles.js";
+import batteryRoutes from "./routes/batteries.js";
+
 
 
 const app = express();
@@ -45,6 +48,9 @@ app.use("/api/users", auth, usersRoutes);
 // Prep requests (assignments Supervisor/Superadmin -> Cook)
 app.use("/api/prep-requests", auth, prepRequestsRoutes);
 app.use("/api/combos", combosRoutes);
+
+app.use("/api/vehicles", vehicleRoutes);
+app.use("/api/batteries", batteryRoutes);
 
 
 // --- Basic routes ---
