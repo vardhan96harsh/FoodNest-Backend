@@ -1,7 +1,8 @@
 import express from "express";
 import Battery from "../models/Battery.js";
 import Vehicle from "../models/Vehicle.js";
-import auth from "../middleware/auth.js";
+import { auth } from "../middleware/auth.js";
+
 
 const router = express.Router();
 
