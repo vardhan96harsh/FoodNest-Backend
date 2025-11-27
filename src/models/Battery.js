@@ -3,7 +3,8 @@ import mongoose from "mongoose";
 const batterySchema = new mongoose.Schema(
   {
     imei: { type: String, required: true, unique: true },
-    vehicle: { type: mongoose.Schema.Types.ObjectId, ref: "Vehicle", required: true },
+   vehicle: { type: mongoose.Schema.Types.ObjectId, ref: "Vehicle", default: null },
+
     type: { type: String, required: true },      // Lithium-ion 48V
     capacity: { type: String, required: true },  // 20Ah
     installationDate: { type: Date, required: true },
