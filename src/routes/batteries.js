@@ -10,23 +10,24 @@ const router = express.Router();
 --------------------------------------------------------- */
 router.post("/", auth, async (req, res) => {
   try {
-    const { imei, type, capacity, installationDate, status, vehicle } = req.body;
+    let { vehicleId, vehicle, ...body } = req.body;
 
-    // Validate vehicle exists
-    const v = await Vehicle.findById(vehicle);
-    if (!v) return res.status(404).json({ error: "Vehicle not found" });
+    // Allow frontend to send vehicleId or vehicle or null
+    const finalVehicle = vehicleId || vehicle || null;
+
+    // If vehicle is provided, check if it exists
+    if (finalVehicle) {
+      const exists = await Vehicle.findById(finalVehicle);
+      if (!exists)
+        return res.status(404).json({ error: "Vehicle not found" });
+    }
 
     const battery = new Battery({
-      imei,
-      type,
-      capacity,
-      installationDate: new Date(installationDate),
-      status,
-      vehicle,
+      ...body,
+      vehicle: finalVehicle, // can be null
     });
 
     await battery.save();
-
     res.status(201).json(battery);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -50,14 +51,22 @@ router.get("/", auth, async (req, res) => {
 --------------------------------------------------------- */
 router.put("/:id", auth, async (req, res) => {
   try {
-    const updates = req.body;
+    let { vehicleId, vehicle, ...body } = req.body;
 
-    if (updates.installationDate)
-      updates.installationDate = new Date(updates.installationDate);
+    const finalVehicle = vehicleId || vehicle || null;
 
-    const updated = await Battery.findByIdAndUpdate(req.params.id, updates, {
-      new: true,
-    }).populate("vehicle");
+    // If vehicle is provided, check if exists
+    if (finalVehicle) {
+      const exists = await Vehicle.findById(finalVehicle);
+      if (!exists)
+        return res.status(404).json({ error: "Vehicle not found" });
+    }
+
+    const updated = await Battery.findByIdAndUpdate(
+      req.params.id,
+      { ...body, vehicle: finalVehicle },
+      { new: true }
+    );
 
     res.json(updated);
   } catch (e) {
