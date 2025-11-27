@@ -3,18 +3,28 @@ import Battery from "../models/Battery.js";
 import Vehicle from "../models/Vehicle.js";
 import { auth } from "../middleware/auth.js";
 
-
 const router = express.Router();
 
-// CREATE BATTERY
+/* ---------------------------------------------------------
+   CREATE BATTERY
+--------------------------------------------------------- */
 router.post("/", auth, async (req, res) => {
   try {
-    const { vehicle } = req.body;
+    const { imei, type, capacity, installationDate, status, vehicle } = req.body;
 
+    // Validate vehicle exists
     const v = await Vehicle.findById(vehicle);
     if (!v) return res.status(404).json({ error: "Vehicle not found" });
 
-    const battery = new Battery(req.body);
+    const battery = new Battery({
+      imei,
+      type,
+      capacity,
+      installationDate: new Date(installationDate),
+      status,
+      vehicle,
+    });
+
     await battery.save();
 
     res.status(201).json(battery);
@@ -23,7 +33,9 @@ router.post("/", auth, async (req, res) => {
   }
 });
 
-// GET ALL
+/* ---------------------------------------------------------
+   GET ALL BATTERIES
+--------------------------------------------------------- */
 router.get("/", auth, async (req, res) => {
   try {
     const batteries = await Battery.find().populate("vehicle");
@@ -33,17 +45,29 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-// UPDATE
+/* ---------------------------------------------------------
+   UPDATE BATTERY
+--------------------------------------------------------- */
 router.put("/:id", auth, async (req, res) => {
   try {
-    const updated = await Battery.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const updates = req.body;
+
+    if (updates.installationDate)
+      updates.installationDate = new Date(updates.installationDate);
+
+    const updated = await Battery.findByIdAndUpdate(req.params.id, updates, {
+      new: true,
+    }).populate("vehicle");
+
     res.json(updated);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE
+/* ---------------------------------------------------------
+   DELETE BATTERY
+--------------------------------------------------------- */
 router.delete("/:id", auth, async (req, res) => {
   try {
     await Battery.findByIdAndDelete(req.params.id);
