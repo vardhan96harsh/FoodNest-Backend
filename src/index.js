@@ -22,7 +22,7 @@ import combosRoutes from "./routes/combos.js";
 import vehicleRoutes from "./routes/vehicles.js";
 import batteryRoutes from "./routes/batteries.js";
 import supervisorRoutes from "./routes/supervisor.routes.js";
-import routeRoutes from "./routes/routes.routes.js";
+import routeRoutes from "./routes/routes.js";
 
 
 
