@@ -333,24 +333,28 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
 
 router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, supervisors = [], riders = [], cooks = [], routes = [] } = req.body;
+    const { name, supervisors = [], riders = [], cooks = [], refillCoordinators = [], refillStaff = [], routes = [] } = req.body;
 
-    const team = await Team.create({ name, supervisors, riders, cooks });
+    const team = await Team.create({
+      name,
+      supervisors,
+      riders,
+      cooks,
+      refillCoordinators,
+      refillStaff,
+      routes
+    });
 
-    // Assign routes to this team
     if (routes.length > 0) {
       await Route.updateMany(
-        { _id: { $in: routes }, team: null },
+        { _id: { $in: routes } },
         {
           $set: {
             team: team._id,
-            supervisor: supervisors[0] || null
+            supervisor: supervisors?.[0] || null
           }
         }
       );
-
-      team.routes = routes;
-      await team.save();
     }
 
     res.status(201).json({ ok: true, id: String(team._id) });
@@ -361,22 +365,52 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
 });
 
 
+
 /** PATCH /api/admin/teams/:id — update team */
 router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const allow = ["name", "supervisors", "riders", "cooks","refillCoordinators",
-  "refillStaff"];
-    const update = {};
-    for (const k of allow) if (k in req.body) update[k] = req.body[k];
+    const { name, supervisors, riders, cooks, refillCoordinators, refillStaff, routes } = req.body;
 
-    const team = await Team.findByIdAndUpdate(req.params.id, update, { new: true });
+    const team = await Team.findById(req.params.id);
     if (!team) return res.status(404).json({ error: "Not found" });
+
+    // Unassign old routes
+    await Route.updateMany(
+      { _id: { $in: team.routes } },
+      { $set: { team: null, supervisor: null } }
+    );
+
+    // Assign selected routes
+    if (routes?.length > 0) {
+      await Route.updateMany(
+        { _id: { $in: routes } },
+        {
+          $set: {
+            team: team._id,
+            supervisor: supervisors?.[0] || null
+          }
+        }
+      );
+    }
+
+    // Update fields
+    if (name) team.name = name;
+    if (supervisors) team.supervisors = supervisors;
+    if (riders) team.riders = riders;
+    if (cooks) team.cooks = cooks;
+    if (refillCoordinators) team.refillCoordinators = refillCoordinators;
+    if (refillStaff) team.refillStaff = refillStaff;
+    if (routes) team.routes = routes;
+
+    await team.save();
+
     res.json({ ok: true });
   } catch (err) {
     console.error("Update team error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
+
 
 /** DELETE /api/admin/teams/:id — remove team */
 router.delete("/teams/:id", auth, requireRole("superadmin"), async (req, res) => {
@@ -456,6 +490,21 @@ router.post("/routes/:id/assign-users", auth, requireRole("supervisor"), async (
     res.status(500).json({ error: "Server error" });
   }
 });
+
+/** GET list of all routes (for assigning to teams) */
+router.get("/routes/list", auth, requireRole("superadmin"), async (_req, res) => {
+  try {
+    const routes = await Route.find({})
+      .select("_id name team")
+      .lean();
+
+    res.json({ routes });
+  } catch (err) {
+    console.error("List routes error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 
 
 export default router;
