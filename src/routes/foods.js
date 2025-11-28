@@ -43,10 +43,21 @@ function parseQuantity(input) {
 /**
  * GET /api/foods
  */
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
   const docs = await FoodItem.find().sort({ createdAt: -1 }).lean();
-  res.json(docs);
+
+  const fixed = docs.map(d => ({
+    ...d,
+    imageUrl: d.imageUrl
+      ? d.imageUrl
+      : d.imagePath
+      ? `${req.protocol}://${req.get("host")}/uploads/${d.imagePath}`
+      : null,
+  }));
+
+  res.json(fixed);
 });
+
 
 /**
  * POST /api/foods
@@ -182,7 +193,8 @@ router.patch(
         const newUrl = makePublicUrl(req, newRel);
 
         if (doc.imagePath) {
-          const absOld = path.resolve("uploads", doc.imagePath);
+   const absOld = path.join(process.cwd(), "uploads", doc.imagePath);
+
           fs.promises.unlink(absOld).catch(() => {});
         }
 
@@ -211,7 +223,8 @@ router.delete("/:id", async (req, res) => {
     if (!doc) return res.status(404).json({ error: "Not found" });
 
     if (doc?.imagePath) {
-      const abs = path.resolve("uploads", doc.imagePath);
+   const abs = path.join(process.cwd(), "uploads", doc.imagePath);
+
       fs.promises.unlink(abs).catch(() => {});
     }
 
