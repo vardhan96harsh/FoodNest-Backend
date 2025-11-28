@@ -5,76 +5,54 @@ import { User } from "../models/User.js";
 
 const router = express.Router();
 
-/**
- * CREATE ROUTE — SUPERADMIN ONLY
- * { name, region, stops: [{name, lat?, lng?}], supervisorId }
- */
+/* ------------------ GET ALL ROUTES ------------------ */
+router.get("/", auth, requireRole("superadmin"), async (_req, res) => {
+  try {
+    const routes = await Route.find()
+      .populate("supervisor", "name email")
+      .populate("rider", "name email")
+      .populate("refillCoordinator", "name email")
+      .lean();
+
+    res.json({ routes });   // ✅ frontend expects this!
+  } catch (err) {
+    console.error("List routes error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ------------------ CREATE ROUTE ------------------ */
 router.post("/", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, region, stops = [], supervisorId } = req.body;
+    const { name, region, stops } = req.body;
 
-    if (!name || !region)
-      return res.status(400).json({ error: "name and region required" });
-
-    if (!Array.isArray(stops) || stops.length === 0)
-      return res.status(400).json({ error: "At least 1 stop required" });
-
-    // Check supervisor is valid
-    let supervisor = null;
-    if (supervisorId) {
-      supervisor = await User.findOne({
-        _id: supervisorId,
-        role: "supervisor"
-      });
-      if (!supervisor)
-        return res.status(400).json({ error: "Invalid supervisorId" });
+    if (!name || !region || !Array.isArray(stops) || stops.length === 0) {
+      return res.status(400).json({ error: "name, region, stops[] required" });
     }
+
+    const formattedStops = stops.map(s => ({
+      name: s,
+      lat: null,
+      lng: null,
+      status: "pending"
+    }));
 
     const route = await Route.create({
       name,
       region,
-      stops,
-      supervisor: supervisorId || null,
+      stops: formattedStops,
+      status: "Active",
       createdBy: req.user.id
     });
 
-    res.status(201).json(route);
+    res.status(201).json({ ok: true, route });
   } catch (err) {
-    console.error("POST /routes error:", err);
-    res.status(500).json({ error: "Server Error" });
+    console.error("Create route error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * ASSIGN SUPERVISOR (ONLY ONCE)
- */
-router.patch("/:id/assign-supervisor", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    const { supervisorId } = req.body;
-
-    const route = await Route.findById(req.params.id);
-    if (!route) return res.status(404).json({ error: "Route not found" });
-
-    if (route.supervisor)
-      return res.status(400).json({ error: "Supervisor already assigned to this route" });
-
-    const sup = await User.findOne({ _id: supervisorId, role: "supervisor" });
-    if (!sup) return res.status(400).json({ error: "Invalid supervisorId" });
-
-    route.supervisor = supervisorId;
-    route.updatedBy = req.user.id;
-    await route.save();
-
-    res.json(route);
-  } catch (err) {
-    console.error("Supervisor assignment error:", err);
-    res.status(500).json({ error: "Server Error" });
-  }
-});
-
-/**
- * EDIT ROUTE (name, region, stops) — SUPERADMIN ONLY
- */
+/* ------------------ EDIT ROUTE ------------------ */
 router.patch("/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const { name, region, stops } = req.body;
@@ -87,35 +65,26 @@ router.patch("/:id", auth, requireRole("superadmin"), async (req, res) => {
     update.updatedBy = req.user.id;
 
     const route = await Route.findByIdAndUpdate(req.params.id, update, { new: true });
-
     if (!route) return res.status(404).json({ error: "Route not found" });
 
-    res.json(route);
+    res.json({ ok: true, route });
   } catch (err) {
-    console.error("PATCH /routes error:", err);
-    res.status(500).json({ error: "Server Error" });
+    console.error("PATCH route error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * GET ALL ROUTES (SUPERADMIN)
- */
-router.get("/", auth, requireRole("superadmin"), async (req, res) => {
-  const routes = await Route.find()
-    .populate("supervisor", "name email")
-    .populate("rider", "name email")
-    .populate("refillCoordinator", "name email")
-    .lean();
-  res.json(routes);
-});
-
-/**
- * DELETE ROUTE — SUPERADMIN ONLY
- */
+/* ------------------ DELETE ROUTE ------------------ */
 router.delete("/:id", auth, requireRole("superadmin"), async (req, res) => {
-  const route = await Route.findByIdAndDelete(req.params.id);
-  if (!route) return res.status(404).json({ error: "Route not found" });
-  res.json({ ok: true });
+  try {
+    const route = await Route.findByIdAndDelete(req.params.id);
+    if (!route) return res.status(404).json({ error: "Route not found" });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE route error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 export default router;
