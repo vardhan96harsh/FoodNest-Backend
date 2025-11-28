@@ -21,6 +21,8 @@ import combosRoutes from "./routes/combos.js";
 
 import vehicleRoutes from "./routes/vehicles.js";
 import batteryRoutes from "./routes/batteries.js";
+import supervisorRoutes from "./routes/supervisor.routes.js";
+import routeRoutes from "./routes/routes.routes.js";
 
 
 
@@ -62,6 +64,9 @@ app.get("/health", (_req, res) =>
 // --- API routes ---
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
+
+app.use("/api/supervisor", supervisorRoutes);
+app.use("/api/routes", routeRoutes);
 
 // --- Seed SuperAdmin (from .env) ---
 async function ensureSuperAdmin() {

@@ -8,7 +8,7 @@ import { encryptJson, decryptJson, maskAccountNumber } from "../utils/crypto.js"
 import bcrypt from "bcryptjs";
 import { sendApprovalEmail , sendDeclinedEmail } from "../utils/mailer.js";
 import { Team } from "../models/Team.js";
-
+import { Route } from "../models/Route.js";
 const router = express.Router();
 
 function pickUserFields(body = {}) {
@@ -299,23 +299,30 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
   try {
     const teams = await Team.find({})
       .sort({ createdAt: -1 })
-      .populate([
-        { path: "supervisors", select: "name email role" },
-        { path: "riders", select: "name email role" },
-        { path: "cooks", select: "name email role" },
-      ])
+   .populate([
+  { path: "supervisors", select: "name email role" },
+  { path: "riders", select: "name email role" },
+  { path: "cooks", select: "name email role" },
+  { path: "refillCoordinators", select: "name email role" },
+  { path: "refillStaff", select: "name email role" },
+])
+
       .lean();
 
     // Shape for the app: names + ids, created date, (optional) routes count if you add later
-    const items = teams.map(t => ({
-      id: String(t._id),
-      name: t.name,
-      created: t.createdAt?.toISOString?.().slice(0,10),
-      routes: 0, // replace if you track routes
-      supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name, email: u.email })) || [],
-      riders: t.riders?.map(u => ({ id: String(u._id), name: u.name, email: u.email })) || [],
-      cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name, email: u.email })) || [],
-    }));
+ const items = teams.map(t => ({
+  id: String(t._id),
+  name: t.name,
+  created: t.createdAt?.toISOString?.().slice(0,10),
+  routes: t.routes?.length || 0,
+
+  supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name })) || [],
+  riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
+  cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name })) || [],
+  refillCoordinators: t.refillCoordinators?.map(u => ({ id: u._id, name: u.name })) || [],
+  refillStaff: t.refillStaff?.map(u => ({ id: u._id, name: u.name })) || [],
+}));
+
 
     res.json({ items });
   } catch (err) {
@@ -324,31 +331,41 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
   }
 });
 
-/** POST /api/admin/teams — create team */
 router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, supervisors = [], riders = [], cooks = [] } = req.body;
-    if (!name?.trim()) return res.status(400).json({ error: "Team name required" });
+    const { name, supervisors = [], riders = [], cooks = [], routes = [] } = req.body;
 
-    const team = await Team.create({
-      name: name.trim(),
-      supervisors,
-      riders,
-      cooks,
-    });
+    const team = await Team.create({ name, supervisors, riders, cooks });
+
+    // Assign routes to this team
+    if (routes.length > 0) {
+      await Route.updateMany(
+        { _id: { $in: routes }, team: null },
+        {
+          $set: {
+            team: team._id,
+            supervisor: supervisors[0] || null
+          }
+        }
+      );
+
+      team.routes = routes;
+      await team.save();
+    }
 
     res.status(201).json({ ok: true, id: String(team._id) });
   } catch (err) {
-    if (err?.code === 11000) return res.status(409).json({ error: "Team name already exists" });
     console.error("Create team error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
+
 /** PATCH /api/admin/teams/:id — update team */
 router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const allow = ["name", "supervisors", "riders", "cooks"];
+    const allow = ["name", "supervisors", "riders", "cooks","refillCoordinators",
+  "refillStaff"];
     const update = {};
     for (const k of allow) if (k in req.body) update[k] = req.body[k];
 
@@ -370,6 +387,72 @@ router.delete("/teams/:id", auth, requireRole("superadmin"), async (req, res) =>
     res.json({ ok: true });
   } catch (err) {
     console.error("Delete team error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/teams/:id/assign-routes", auth, requireRole("superadmin"), async (req, res) => {
+  try {
+    const { routeIds = [] } = req.body;
+
+    const team = await Team.findById(req.params.id);
+    if (!team) return res.status(404).json({ error: "Team not found" });
+
+    // Prevent assigning routes that already belong to another team
+    const existing = await Route.find({
+      _id: { $in: routeIds },
+      team: { $ne: null }
+    });
+
+    if (existing.length) {
+      return res.status(400).json({
+        error: "Some routes are already assigned to another team",
+        routes: existing.map(r => ({ id: r._id, name: r.name }))
+      });
+    }
+
+    // Assign routes → add supervisor
+    await Route.updateMany(
+      { _id: { $in: routeIds } },
+      {
+        $set: {
+          team: team._id,
+          supervisor: team.supervisors[0] || null
+        }
+      }
+    );
+
+    team.routes = routeIds;
+    await team.save();
+
+    res.json({ ok: true, message: "Routes assigned successfully" });
+
+  } catch (err) {
+    console.error("Assign routes error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/routes/:id/assign-users", auth, requireRole("supervisor"), async (req, res) => {
+  try {
+    const { riderId, refillId } = req.body;
+
+    const route = await Route.findById(req.params.id);
+    if (!route) return res.status(404).json({ error: "Route not found" });
+
+    // Only supervisor of this team can assign
+    if (String(route.supervisor) !== String(req.user.id)) {
+      return res.status(403).json({ error: "You are not assigned as supervisor for this route" });
+    }
+
+    route.rider = riderId || null;
+    route.refillCoordinator = refillId || null;
+
+    await route.save();
+
+    res.json({ ok: true, message: "Users assigned successfully" });
+  } catch (err) {
+    console.error("Assign riders error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });

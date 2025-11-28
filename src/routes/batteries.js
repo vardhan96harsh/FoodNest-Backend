@@ -13,7 +13,11 @@ router.post("/", auth, async (req, res) => {
     let { vehicleId, vehicle, ...body } = req.body;
 
     // Allow frontend to send vehicleId or vehicle or null
-    const finalVehicle = vehicleId || vehicle || null;
+   const finalVehicle =
+  vehicleId && vehicleId.trim() !== "" ? vehicleId :
+  vehicle && vehicle.trim() !== "" ? vehicle :
+  null;
+
 
     // If vehicle is provided, check if it exists
     if (finalVehicle) {
