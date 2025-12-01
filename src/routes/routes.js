@@ -22,18 +22,20 @@ router.get("/", auth, requireRole("superadmin"), async (_req, res) => {
 });
 
 /* ------------------ CREATE ROUTE ------------------ */
+/* ------------------ CREATE ROUTE ------------------ */
 router.post("/", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const { name, region, stops } = req.body;
 
     if (!name || !region || !Array.isArray(stops) || stops.length === 0) {
-      return res.status(400).json({ error: "name, region, stops[] required" });
+      return res.status(400).json({ error: "name, region & stops[] required" });
     }
 
+    // FIX ⭐ — Map stops correctly
     const formattedStops = stops.map(s => ({
-      name: s,
-      lat: null,
-      lng: null,
+      name: s.name || "Unnamed Stop",
+      lat: Number(s.lat) || 0,
+      lng: Number(s.lng) || 0,
       status: "pending"
     }));
 
@@ -47,10 +49,12 @@ router.post("/", auth, requireRole("superadmin"), async (req, res) => {
 
     res.status(201).json({ ok: true, route });
   } catch (err) {
-    console.error("Create route error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Create route error:", err.message);
+    console.error(err);
+    res.status(400).json({ error: err.message });
   }
 });
+
 
 /* ------------------ EDIT ROUTE ------------------ */
 router.patch("/:id", auth, requireRole("superadmin"), async (req, res) => {
