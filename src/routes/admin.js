@@ -292,37 +292,51 @@ router.post("/requests/:id/decline", auth, requireRole("superadmin"), async (req
 
 
 //Team management 
-
-
-/** GET /api/admin/teams — list teams (populated members) */
+/** GET /api/admin/teams */
 router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
   try {
     const teams = await Team.find({})
       .sort({ createdAt: -1 })
-   .populate([
-  { path: "supervisors", select: "name email role" },
-  { path: "riders", select: "name email role" },
-  { path: "cooks", select: "name email role" },
-  { path: "refillCoordinators", select: "name email role" },
-  { path: "refillStaff", select: "name email role" },
-])
+      .populate([
+        { path: "supervisors", select: "name email role" },
+        { path: "riders", select: "name email role" },
+        { path: "cooks", select: "name email role" },
+        { path: "refillCoordinators", select: "name email role" },
+        { path: "refillStaff", select: "name email role" },
 
+        // ⭐ NEW POPULATION
+        { path: "vehicles", select: "name registrationNo status" },
+        { path: "batteries", select: "imei status type capacity" }
+      ])
       .lean();
 
-    // Shape for the app: names + ids, created date, (optional) routes count if you add later
- const items = teams.map(t => ({
-  id: String(t._id),
-  name: t.name,
-  created: t.createdAt?.toISOString?.().slice(0,10),
-  routes: t.routes?.length || 0,
+    const items = teams.map(t => ({
+      id: String(t._id),
+      name: t.name,
+      created: t.createdAt?.toISOString?.().slice(0,10),
 
-  supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name })) || [],
-  riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
-  cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name })) || [],
-  refillCoordinators: t.refillCoordinators?.map(u => ({ id: u._id, name: u.name })) || [],
-  refillStaff: t.refillStaff?.map(u => ({ id: u._id, name: u.name })) || [],
-}));
+      routes: t.routes?.length || 0,
 
+      supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name })) || [],
+      riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
+      cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name })) || [],
+      refillCoordinators: t.refillCoordinators?.map(u => ({ id: String(u._id), name: u.name })) || [],
+      refillStaff: t.refillStaff?.map(u => ({ id: String(u._id), name: u.name })) || [],
+
+      // ⭐ NEW FORMAT FOR FRONTEND
+      vehicles: t.vehicles?.map(v => ({
+        id: String(v._id),
+        name: v.name,
+        registrationNo: v.registrationNo,
+        status: v.status
+      })) || [],
+
+      batteries: t.batteries?.map(b => ({
+        id: String(b._id),
+        imei: b.imei,
+        status: b.status
+      })) || [],
+    }));
 
     res.json({ items });
   } catch (err) {
@@ -331,10 +345,46 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
   }
 });
 
+
 router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, supervisors = [], riders = [], cooks = [], refillCoordinators = [], refillStaff = [], routes = [] } = req.body;
+    const {
+      name,
+      supervisors = [],
+      riders = [],
+      cooks = [],
+      refillCoordinators = [],
+      refillStaff = [],
+      vehicles = [],
+      batteries = [],
+      routes = []
+    } = req.body;
 
+    // ⭐ STRICT RULE: Vehicle can belong to only one team
+    const takenVehicles = await Vehicle.find({
+      _id: { $in: vehicles },
+      team: { $ne: null }
+    });
+
+    if (takenVehicles.length)
+      return res.status(400).json({
+        error: "Some vehicles already belong to a team",
+        vehicles: takenVehicles.map(v => ({ id: v._id, name: v.name }))
+      });
+
+    // ⭐ STRICT RULE: Battery belongs to only one team
+    const takenBatteries = await Battery.find({
+      _id: { $in: batteries },
+      team: { $ne: null }
+    });
+
+    if (takenBatteries.length)
+      return res.status(400).json({
+        error: "Some batteries already belong to another team",
+        batteries: takenBatteries.map(b => ({ id: b._id, imei: b.imei }))
+      });
+
+    // ⭐ CREATE TEAM
     const team = await Team.create({
       name,
       supervisors,
@@ -342,22 +392,32 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
       cooks,
       refillCoordinators,
       refillStaff,
+      vehicles,
+      batteries,
       routes
     });
 
-    if (routes.length > 0) {
+    // ⭐ ASSIGN VEHICLES & BATTERIES
+    await Vehicle.updateMany(
+      { _id: { $in: vehicles }},
+      { $set: { team: team._id }}
+    );
+
+    await Battery.updateMany(
+      { _id: { $in: batteries }},
+      { $set: { team: team._id }}
+    );
+
+    // ⭐ ASSIGN ROUTES
+    if (routes.length) {
       await Route.updateMany(
-        { _id: { $in: routes } },
-        {
-          $set: {
-            team: team._id,
-            supervisor: supervisors?.[0] || null
-          }
-        }
+        { _id: { $in: routes }},
+        { $set: { team: team._id, supervisor: supervisors?.[0] || null }}
       );
     }
 
     res.status(201).json({ ok: true, id: String(team._id) });
+
   } catch (err) {
     console.error("Create team error:", err);
     res.status(500).json({ error: "Server error" });
@@ -369,42 +429,73 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
 /** PATCH /api/admin/teams/:id — update team */
 router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, supervisors, riders, cooks, refillCoordinators, refillStaff, routes } = req.body;
+    const {
+      name, supervisors, riders, cooks,
+      refillCoordinators, refillStaff,
+      vehicles = [], batteries = [], routes = []
+    } = req.body;
 
     const team = await Team.findById(req.params.id);
     if (!team) return res.status(404).json({ error: "Not found" });
 
-    // Unassign old routes
-    await Route.updateMany(
-      { _id: { $in: team.routes } },
-      { $set: { team: null, supervisor: null } }
+    // ⭐ UNASSIGN OLD VEHICLES & BATTERIES
+    await Vehicle.updateMany(
+      { _id: { $in: team.vehicles }},
+      { $set: { team: null }}
     );
 
-    // Assign selected routes
-    if (routes?.length > 0) {
-      await Route.updateMany(
-        { _id: { $in: routes } },
-        {
-          $set: {
-            team: team._id,
-            supervisor: supervisors?.[0] || null
-          }
-        }
-      );
-    }
+    await Battery.updateMany(
+      { _id: { $in: team.batteries }},
+      { $set: { team: null }}
+    );
 
-    // Update fields
+    // ⭐ STRICT RULE RECHECK
+    const takenVehicles = await Vehicle.find({
+      _id: { $in: vehicles },
+      team: { $ne: null }
+    });
+    if (takenVehicles.length)
+      return res.status(400).json({ error: "Some vehicles already belong to another team" });
+
+    const takenBatteries = await Battery.find({
+      _id: { $in: batteries },
+      team: { $ne: null }
+    });
+    if (takenBatteries.length)
+      return res.status(400).json({ error: "Some batteries already belong to another team" });
+
+    // ⭐ ASSIGN NEW VEHICLE & BATTERY SET
+    await Vehicle.updateMany(
+      { _id: { $in: vehicles } },
+      { $set: { team: team._id } }
+    );
+
+    await Battery.updateMany(
+      { _id: { $in: batteries } },
+      { $set: { team: team._id } }
+    );
+
+    // ⭐ UPDATE TEAM
     if (name) team.name = name;
     if (supervisors) team.supervisors = supervisors;
     if (riders) team.riders = riders;
     if (cooks) team.cooks = cooks;
     if (refillCoordinators) team.refillCoordinators = refillCoordinators;
     if (refillStaff) team.refillStaff = refillStaff;
-    if (routes) team.routes = routes;
+    team.vehicles = vehicles;
+    team.batteries = batteries;
+    team.routes = routes;
 
     await team.save();
 
+    // ⭐ UPDATE ROUTES
+    await Route.updateMany(
+      { _id: { $in: routes }},
+      { $set: { team: team._id, supervisor: supervisors?.[0] || null }}
+    );
+
     res.json({ ok: true });
+
   } catch (err) {
     console.error("Update team error:", err);
     res.status(500).json({ error: "Server error" });
