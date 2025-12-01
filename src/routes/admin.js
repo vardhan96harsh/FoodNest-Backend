@@ -136,7 +136,27 @@ router.post("/users", auth, requireRole("superadmin"), async (req, res) => {
 router.get("/users", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const filter = {};
-    if (req.query.role) filter.role = req.query.role;
+    // FIX role mismatch coming from frontend
+if (req.query.role) {
+  const r = req.query.role.toLowerCase();
+
+  if (r.includes("refill")) {
+    filter.role = { $in: ["refill", "refillCoordinator", "Refill Coordinator", "refil", "refillCor"] };
+  } 
+  else if (r.includes("supervisor")) {
+    filter.role = { $in: ["supervisor", "Supervisor"] };
+  } 
+  else if (r.includes("rider")) {
+    filter.role = { $in: ["rider", "Rider"] };
+  } 
+  else if (r.includes("cook")) {
+    filter.role = { $in: ["cook", "Cook"] };
+  } 
+  else {
+    filter.role = req.query.role;
+  }
+}
+
     const users = await User.find(filter)
       .select("_id name email role disabled createdAt")
       .sort({ createdAt: -1 })
