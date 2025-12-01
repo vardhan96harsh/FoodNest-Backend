@@ -136,27 +136,7 @@ router.post("/users", auth, requireRole("superadmin"), async (req, res) => {
 router.get("/users", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const filter = {};
-    // FIX role mismatch coming from frontend
-if (req.query.role) {
-  const r = req.query.role.toLowerCase();
-
-  if (r.includes("refill")) {
-    filter.role = { $in: ["refill", "refillCoordinator", "Refill Coordinator", "refil", "refillCor"] };
-  } 
-  else if (r.includes("supervisor")) {
-    filter.role = { $in: ["supervisor", "Supervisor"] };
-  } 
-  else if (r.includes("rider")) {
-    filter.role = { $in: ["rider", "Rider"] };
-  } 
-  else if (r.includes("cook")) {
-    filter.role = { $in: ["cook", "Cook"] };
-  } 
-  else {
-    filter.role = req.query.role;
-  }
-}
-
+    if (req.query.role) filter.role = req.query.role;
     const users = await User.find(filter)
       .select("_id name email role disabled createdAt")
       .sort({ createdAt: -1 })
@@ -385,8 +365,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
     // ⭐ STRICT RULE: Vehicle can belong to only one team
     const takenVehicles = await Vehicle.find({
       _id: { $in: vehicles },
-      team: { $ne: null }
-    });
+      team: { $exists: true, $ne: null }     });
 
     if (takenVehicles.length)
       return res.status(400).json({
@@ -397,8 +376,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
     // ⭐ STRICT RULE: Battery belongs to only one team
     const takenBatteries = await Battery.find({
       _id: { $in: batteries },
-      team: { $ne: null }
-    });
+       team: { $exists: true, $ne: null }      });
 
     if (takenBatteries.length)
       return res.status(400).json({
@@ -474,14 +452,13 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
     // ⭐ STRICT RULE RECHECK
     const takenVehicles = await Vehicle.find({
       _id: { $in: vehicles },
-      team: { $ne: null }
-    });
+      team: { $exists: true, $ne: null }    });
     if (takenVehicles.length)
       return res.status(400).json({ error: "Some vehicles already belong to another team" });
 
     const takenBatteries = await Battery.find({
       _id: { $in: batteries },
-      team: { $ne: null }
+      team: { $exists: true, $ne: null }
     });
     if (takenBatteries.length)
       return res.status(400).json({ error: "Some batteries already belong to another team" });
