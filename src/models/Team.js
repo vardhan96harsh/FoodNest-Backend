@@ -1,4 +1,3 @@
-// src/models/Team.js
 import mongoose from "mongoose";
 
 const { Schema } = mongoose;
@@ -11,18 +10,14 @@ const TeamSchema = new Schema(
     riders: [{ type: Schema.Types.ObjectId, ref: "User" }],
     cooks: [{ type: Schema.Types.ObjectId, ref: "User" }],
     refillCoordinators: [{ type: Schema.Types.ObjectId, ref: "User" }],
-    refillStaff: [{ type: Schema.Types.ObjectId, ref: "User" }],
 
-    // ⭐ NEW FIELDS
     vehicles: [{ type: Schema.Types.ObjectId, ref: "Vehicle" }],
     batteries: [{ type: Schema.Types.ObjectId, ref: "Battery" }],
-
     routes: [{ type: Schema.Types.ObjectId, ref: "Route" }],
   },
   { timestamps: true }
 );
 
-// Role validation — existing logic
 TeamSchema.pre("save", async function (next) {
   const U = (await import("./User.js")).default;
 
@@ -36,8 +31,9 @@ TeamSchema.pre("save", async function (next) {
   await validateRole(this.supervisors, "supervisor");
   await validateRole(this.riders, "rider");
   await validateRole(this.cooks, "cook");
-  await validateRole(this.refillCoordinators, "refillCoordinater");
-  await validateRole(this.refillStaff, "refillStaff");
+
+  // FINAL CORRECT ROLE
+  await validateRole(this.refillCoordinators, "refillCoordinator");
 
   next();
 });

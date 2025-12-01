@@ -9,7 +9,8 @@ const batterySchema = new mongoose.Schema(
     capacity: { type: String, required: true },  // 20Ah
     installationDate: { type: Date, required: true },
     status: { type: String, default: "Active" }, // Active / Faulty / Replaced
-    lastChecked: { type: Date, default: Date.now }
+    lastChecked: { type: Date, default: Date.now },
+     team: { type: mongoose.Schema.Types.ObjectId, ref: "Team", default: null },
   },
   { timestamps: true }
 );

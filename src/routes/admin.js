@@ -9,6 +9,9 @@ import bcrypt from "bcryptjs";
 import { sendApprovalEmail , sendDeclinedEmail } from "../utils/mailer.js";
 import { Team } from "../models/Team.js";
 import { Route } from "../models/Route.js";
+import Vehicle from "../models/Vehicle.js";
+import Battery from "../models/Battery.js";
+
 const router = express.Router();
 
 function pickUserFields(body = {}) {
@@ -302,7 +305,7 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
         { path: "riders", select: "name email role" },
         { path: "cooks", select: "name email role" },
         { path: "refillCoordinators", select: "name email role" },
-        { path: "refillStaff", select: "name email role" },
+        
 
         // ⭐ NEW POPULATION
         { path: "vehicles", select: "name registrationNo status" },
@@ -321,8 +324,7 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
       riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
       cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name })) || [],
       refillCoordinators: t.refillCoordinators?.map(u => ({ id: String(u._id), name: u.name })) || [],
-      refillStaff: t.refillStaff?.map(u => ({ id: String(u._id), name: u.name })) || [],
-
+     
       // ⭐ NEW FORMAT FOR FRONTEND
       vehicles: t.vehicles?.map(v => ({
         id: String(v._id),
@@ -354,7 +356,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
       riders = [],
       cooks = [],
       refillCoordinators = [],
-      refillStaff = [],
+     
       vehicles = [],
       batteries = [],
       routes = []
@@ -391,7 +393,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
       riders,
       cooks,
       refillCoordinators,
-      refillStaff,
+    
       vehicles,
       batteries,
       routes
@@ -431,7 +433,7 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
   try {
     const {
       name, supervisors, riders, cooks,
-      refillCoordinators, refillStaff,
+      refillCoordinators,
       vehicles = [], batteries = [], routes = []
     } = req.body;
 
@@ -481,7 +483,7 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
     if (riders) team.riders = riders;
     if (cooks) team.cooks = cooks;
     if (refillCoordinators) team.refillCoordinators = refillCoordinators;
-    if (refillStaff) team.refillStaff = refillStaff;
+   
     team.vehicles = vehicles;
     team.batteries = batteries;
     team.routes = routes;

@@ -28,7 +28,10 @@ const vehicleSchema = new mongoose.Schema(
 
     // ⭐ SERVICE RECORDS INSIDE VEHICLE
     serviceRecords: [serviceRecordSchema],
+     team: { type: mongoose.Schema.Types.ObjectId, ref: "Team", default: null },
   },
+
+  
   { timestamps: true }
 );
 
