@@ -57,6 +57,7 @@ router.post("/", auth, requireRole("superadmin"), async (req, res) => {
 
 
 /* ------------------ EDIT ROUTE ------------------ */
+/* ------------------ EDIT ROUTE ------------------ */
 router.patch("/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const { name, region, stops } = req.body;
@@ -64,14 +65,31 @@ router.patch("/:id", auth, requireRole("superadmin"), async (req, res) => {
     const update = {};
     if (name) update.name = name;
     if (region) update.region = region;
-    if (Array.isArray(stops)) update.stops = stops;
+
+    // ✅ Accept full stop objects (same as POST)
+    if (Array.isArray(stops)) {
+      update.stops = stops.map(s => ({
+        name: s.name,
+        lat: s.lat ?? null,
+        lng: s.lng ?? null,
+        status: s.status || "pending"
+      }));
+    }
 
     update.updatedBy = req.user.id;
 
-    const route = await Route.findByIdAndUpdate(req.params.id, update, { new: true });
-    if (!route) return res.status(404).json({ error: "Route not found" });
+    const route = await Route.findByIdAndUpdate(
+      req.params.id,
+      update,
+      { new: true }
+    );
+
+    if (!route) {
+      return res.status(404).json({ error: "Route not found" });
+    }
 
     res.json({ ok: true, route });
+
   } catch (err) {
     console.error("PATCH route error:", err);
     res.status(500).json({ error: "Server error" });

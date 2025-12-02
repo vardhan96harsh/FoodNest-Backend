@@ -309,7 +309,8 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
 
         // ⭐ NEW POPULATION
         { path: "vehicles", select: "name registrationNo status" },
-        { path: "batteries", select: "imei status type capacity" }
+        { path: "batteries", select: "imei status type capacity" },
+        { path: "routes", select: "name" }  
       ])
       .lean();
 
@@ -318,7 +319,11 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
       name: t.name,
       created: t.createdAt?.toISOString?.().slice(0,10),
 
-      routes: t.routes?.length || 0,
+     routes: t.routes?.map(r => ({
+  id: String(r._id),
+  name: r.name
+})) || [],
+
 
       supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name })) || [],
       riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
