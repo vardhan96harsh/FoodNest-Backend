@@ -7,7 +7,7 @@ export async function auth(req, res, next) {
   if (!m) return res.status(401).json({ error: "Missing Bearer token" });
   try {
     const payload = verifyToken(m[1]);
-    const user = await User.findById(payload.id).lean();
+    const user = await User.findById(payload.id);  // ← REMOVED .lean()
     if (!user) return res.status(401).json({ error: "Invalid token" });
     req.user = { id: user._id, email: user.email, name: user.name, role: user.role };
     next();

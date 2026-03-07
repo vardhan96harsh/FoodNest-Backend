@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import { User } from "./User.js";
 
-const roles = ["rider", "cook", "supervisor", "refill"]; // users can request only these
+const roles = ["rider", "cook", "supervisor", "refill"];
 
 const RegistrationRequestSchema = new mongoose.Schema(
   {
@@ -14,19 +14,17 @@ const RegistrationRequestSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Set password (hashing)
 RegistrationRequestSchema.methods.setPassword = async function (plain) {
   const salt = await bcrypt.genSalt(10);
   this.passwordHash = await bcrypt.hash(plain, salt);
 };
 
-// Approve -> create user with same creds, then delete request
 RegistrationRequestSchema.methods.approve = async function () {
   const user = new User({
     email: this.email,
     name: this.name,
     role: this.role,
-    passwordHash: this.passwordHash, // already hashed
+    passwordHash: this.passwordHash,
   });
   await user.save();
   await this.deleteOne();

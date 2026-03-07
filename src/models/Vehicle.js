@@ -4,6 +4,7 @@ const serviceRecordSchema = new mongoose.Schema(
   {
     date: { type: Date, required: true },
     type: { type: String, required: true }, // Maintenance / Repair
+    
     description: { type: String, default: "" },
     cost: { type: Number, default: 0 },
     mechanic: { type: String, default: "" },

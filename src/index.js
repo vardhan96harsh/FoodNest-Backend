@@ -21,8 +21,10 @@ import combosRoutes from "./routes/combos.js";
 
 import vehicleRoutes from "./routes/vehicles.js";
 import batteryRoutes from "./routes/batteries.js";
-import supervisorRoutes from "./routes/supervisor.routes.js";
+
 import routeRoutes from "./routes/routes.js";
+import supervisorRoutes from "./routes/supervisor.js";
+import rider from "./routes/rider.js";
 
 
 
@@ -65,8 +67,11 @@ app.get("/health", (_req, res) =>
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 
-app.use("/api/supervisor", supervisorRoutes);
+
 app.use("/api/routes", routeRoutes);
+
+app.use("/api/supervisor", supervisorRoutes);
+app.use("/api/rider", rider);
 
 // --- Seed SuperAdmin (from .env) ---
 async function ensureSuperAdmin() {

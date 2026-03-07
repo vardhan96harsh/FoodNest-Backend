@@ -83,6 +83,9 @@ router.post("/", uploadFoodImage.single("image"), async (req, res) => {
       imageUrl = makePublicUrl(req, imagePath);
     }
 
+  console.log("[POST /foods] imagePath:", imagePath);   // Log the saved image path
+    console.log("[POST /foods] imageUrl:", imageUrl);  
+
     const doc = await FoodItem.create({
       name,
       price: Number(price),

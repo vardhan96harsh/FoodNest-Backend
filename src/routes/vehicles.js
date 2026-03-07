@@ -54,6 +54,20 @@ router.get("/:id", auth, async (req, res) => {
 --------------------------------------------------------- */
 router.put("/:id", auth, async (req, res) => {
   try {
+    // 🔴 NEW CODE: If updating battery field, check it's not assigned elsewhere
+    if (req.body.battery) {
+      const existingBattery = await Battery.findOne({
+        _id: req.body.battery,
+        vehicle: { $ne: null, $ne: req.params.id }  // Battery assigned to a DIFFERENT vehicle
+      });
+      
+      if (existingBattery) {
+        return res.status(400).json({ 
+          error: "This battery is already assigned to another vehicle" 
+        });
+      }
+    }
+
     const updated = await Vehicle.findByIdAndUpdate(
       req.params.id,
       req.body,

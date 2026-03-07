@@ -19,23 +19,53 @@ const TeamSchema = new Schema(
 );
 
 TeamSchema.pre("save", async function (next) {
-  const U = (await import("./User.js")).default;
+  try {
+    const U = (await import("./User.js")).default;
 
-  const validateRole = async (ids, role) => {
-    if (!ids?.length) return;
-    const count = await U.countDocuments({ _id: { $in: ids }, role });
-    if (count !== ids.length)
-      return next(new Error(`One or more ${role} IDs are invalid or have another role`));
-  };
+    const validateRole = async (ids, role) => {
+      if (!ids?.length) return true;
+      const count = await U.countDocuments({ _id: { $in: ids }, role });
+      if (count !== ids.length) {
+        throw new Error(`One or more ${role} IDs are invalid or have another role`);
+      }
+      return true;
+    };
 
-  await validateRole(this.supervisors, "supervisor");
-  await validateRole(this.riders, "rider");
-  await validateRole(this.cooks, "cook");
+    // Validate all roles - if any fail, the error will be caught
+    await validateRole(this.supervisors, "supervisor");
+    await validateRole(this.riders, "rider");
+    await validateRole(this.cooks, "cook");
+    await validateRole(this.refillCoordinators, "refill");
 
-  // FINAL CORRECT ROLE
-  await validateRole(this.refillCoordinators, "refillCoordinator");
+    // Also validate vehicles, batteries, routes exist
+    if (this.vehicles?.length) {
+      const Vehicle = mongoose.model("Vehicle");
+      const vehicleCount = await Vehicle.countDocuments({ _id: { $in: this.vehicles } });
+      if (vehicleCount !== this.vehicles.length) {
+        throw new Error("One or more vehicle IDs are invalid");
+      }
+    }
 
-  next();
+    if (this.batteries?.length) {
+      const Battery = mongoose.model("Battery");
+      const batteryCount = await Battery.countDocuments({ _id: { $in: this.batteries } });
+      if (batteryCount !== this.batteries.length) {
+        throw new Error("One or more battery IDs are invalid");
+      }
+    }
+
+    if (this.routes?.length) {
+      const Route = mongoose.model("Route");
+      const routeCount = await Route.countDocuments({ _id: { $in: this.routes } });
+      if (routeCount !== this.routes.length) {
+        throw new Error("One or more route IDs are invalid");
+      }
+    }
+
+    next(); // All validations passed
+  } catch (error) {
+    next(error); // Pass error to Mongoose
+  }
 });
 
 export const Team = mongoose.model("Team", TeamSchema);

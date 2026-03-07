@@ -6,7 +6,7 @@ import { RegistrationRequest } from "../models/RegistrationRequest.js";
 // import User from "../models/User.js"; // default export in your project
 import { encryptJson, decryptJson, maskAccountNumber } from "../utils/crypto.js";
 import bcrypt from "bcryptjs";
-import { sendApprovalEmail , sendDeclinedEmail } from "../utils/mailer.js";
+import { sendApprovalEmail, sendDeclinedEmail } from "../utils/mailer.js";
 import { Team } from "../models/Team.js";
 import { Route } from "../models/Route.js";
 import Vehicle from "../models/Vehicle.js";
@@ -243,7 +243,7 @@ router.post("/requests/:id/approve", auth, requireRole("superadmin"), async (req
       return res.status(500).json({ error: "RegistrationRequest.approve() not implemented" });
     }
     const user = await doc.approve();
-        // Try sending the approval email; don't fail the API if email fails
+    // Try sending the approval email; don't fail the API if email fails
     let emailSent = false;
     try {
       const result = await sendApprovalEmail(user.email, user.name, user.role);
@@ -252,12 +252,14 @@ router.post("/requests/:id/approve", auth, requireRole("superadmin"), async (req
       console.error("sendApprovalEmail error:", err);
     }
 
-    return res.json({ ok: true, emailSent, user: {
-      id: user._id,
-      email: user.email,
-      name: user.name,
-      role: user.role
-    }});
+    return res.json({
+      ok: true, emailSent, user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        role: user.role
+      }
+    });
   } catch (err) {
     console.error("Approve request error:", err);
     res.status(500).json({ error: "Server error" });
@@ -305,31 +307,31 @@ router.get("/teams", auth, requireRole("superadmin"), async (_req, res) => {
         { path: "riders", select: "name email role" },
         { path: "cooks", select: "name email role" },
         { path: "refillCoordinators", select: "name email role" },
-        
+
 
         // ⭐ NEW POPULATION
         { path: "vehicles", select: "name registrationNo status" },
         { path: "batteries", select: "imei status type capacity" },
-        { path: "routes", select: "name" }  
+        { path: "routes", select: "name" }
       ])
       .lean();
 
     const items = teams.map(t => ({
       id: String(t._id),
       name: t.name,
-      created: t.createdAt?.toISOString?.().slice(0,10),
+      created: t.createdAt?.toISOString?.().slice(0, 10),
 
-     routes: t.routes?.map(r => ({
-  id: String(r._id),
-  name: r.name
-})) || [],
+      routes: t.routes?.map(r => ({
+        id: String(r._id),
+        name: r.name
+      })) || [],
 
 
       supervisors: t.supervisors?.map(u => ({ id: String(u._id), name: u.name })) || [],
       riders: t.riders?.map(u => ({ id: String(u._id), name: u.name })) || [],
       cooks: t.cooks?.map(u => ({ id: String(u._id), name: u.name })) || [],
       refillCoordinators: t.refillCoordinators?.map(u => ({ id: String(u._id), name: u.name })) || [],
-     
+
       // ⭐ NEW FORMAT FOR FRONTEND
       vehicles: t.vehicles?.map(v => ({
         id: String(v._id),
@@ -361,7 +363,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
       riders = [],
       cooks = [],
       refillCoordinators = [],
-     
+
       vehicles = [],
       batteries = [],
       routes = []
@@ -370,7 +372,8 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
     // ⭐ STRICT RULE: Vehicle can belong to only one team
     const takenVehicles = await Vehicle.find({
       _id: { $in: vehicles },
-      team: { $exists: true, $ne: null }     });
+      team: { $exists: true, $ne: null }
+    });
 
     if (takenVehicles.length)
       return res.status(400).json({
@@ -381,7 +384,8 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
     // ⭐ STRICT RULE: Battery belongs to only one team
     const takenBatteries = await Battery.find({
       _id: { $in: batteries },
-       team: { $exists: true, $ne: null }      });
+      team: { $exists: true, $ne: null }
+    });
 
     if (takenBatteries.length)
       return res.status(400).json({
@@ -396,7 +400,7 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
       riders,
       cooks,
       refillCoordinators,
-    
+
       vehicles,
       batteries,
       routes
@@ -404,20 +408,20 @@ router.post("/teams", auth, requireRole("superadmin"), async (req, res) => {
 
     // ⭐ ASSIGN VEHICLES & BATTERIES
     await Vehicle.updateMany(
-      { _id: { $in: vehicles }},
-      { $set: { team: team._id }}
+      { _id: { $in: vehicles } },
+      { $set: { team: team._id } }
     );
 
     await Battery.updateMany(
-      { _id: { $in: batteries }},
-      { $set: { team: team._id }}
+      { _id: { $in: batteries } },
+      { $set: { team: team._id } }
     );
 
     // ⭐ ASSIGN ROUTES
     if (routes.length) {
       await Route.updateMany(
-        { _id: { $in: routes }},
-        { $set: { team: team._id, supervisor: supervisors?.[0] || null }}
+        { _id: { $in: routes } },
+        { $set: { team: team._id } }
       );
     }
 
@@ -445,19 +449,20 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
 
     // ⭐ UNASSIGN OLD VEHICLES & BATTERIES
     await Vehicle.updateMany(
-      { _id: { $in: team.vehicles }},
-      { $set: { team: null }}
+      { _id: { $in: team.vehicles } },
+      { $set: { team: null } }
     );
 
     await Battery.updateMany(
-      { _id: { $in: team.batteries }},
-      { $set: { team: null }}
+      { _id: { $in: team.batteries } },
+      { $set: { team: null } }
     );
 
     // ⭐ STRICT RULE RECHECK
     const takenVehicles = await Vehicle.find({
       _id: { $in: vehicles },
-      team: { $exists: true, $ne: null }    });
+      team: { $exists: true, $ne: null }
+    });
     if (takenVehicles.length)
       return res.status(400).json({ error: "Some vehicles already belong to another team" });
 
@@ -485,18 +490,29 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
     if (riders) team.riders = riders;
     if (cooks) team.cooks = cooks;
     if (refillCoordinators) team.refillCoordinators = refillCoordinators;
-   
+
     team.vehicles = vehicles;
     team.batteries = batteries;
+    const oldRouteIds = (team.routes || []).map(String);
+    const newRouteIds = (routes || []).map(String);
+
+    const removed = oldRouteIds.filter((id) => !newRouteIds.includes(id));
+
+  if (removed.length) {
+  await Route.updateMany(
+    { _id: { $in: removed } },
+    { $set: { team: null, rider: null, refillCoordinator: null } }
+  );
+}
     team.routes = routes;
 
     await team.save();
 
     // ⭐ UPDATE ROUTES
-    await Route.updateMany(
-      { _id: { $in: routes }},
-      { $set: { team: team._id, supervisor: supervisors?.[0] || null }}
-    );
+  await Route.updateMany(
+  { _id: { $in: routes }},
+  { $set: { team: team._id } }
+);
 
     res.json({ ok: true });
 
@@ -507,16 +523,55 @@ router.patch("/teams/:id", auth, requireRole("superadmin"), async (req, res) => 
 });
 
 
-/** DELETE /api/admin/teams/:id — remove team */
+// In your backend admin.js - DELETE endpoint
 router.delete("/teams/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
+    console.log("========== DELETE TEAM REQUEST ==========");
+    console.log("1. Team ID to delete:", req.params.id);
+    
     const team = await Team.findById(req.params.id);
-    if (!team) return res.status(404).json({ error: "Not found" });
+    if (!team) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    // ✅ Unassign vehicles
+    if (team.vehicles?.length) {
+      await Vehicle.updateMany(
+        { _id: { $in: team.vehicles } },
+        { $set: { team: null } }
+      );
+    }
+
+    // ✅ Unassign batteries
+    if (team.batteries?.length) {
+      await Battery.updateMany(
+        { _id: { $in: team.batteries } },
+        { $set: { team: null } }
+      );
+    }
+
+    // ✅ Unassign routes
+    if (team.routes?.length) {
+      await Route.updateMany(
+        { _id: { $in: team.routes } },
+        { $set: { team: null, rider: null, refillCoordinator: null } }
+      );
+    }
+
     await team.deleteOne();
-    res.json({ ok: true });
+    console.log("Team deleted successfully");
+    console.log("========== DELETE COMPLETE ==========");
+
+    // ✅ FIX: Return a more explicit response
+    res.status(200).json({ 
+      success: true, 
+      message: "Team deleted successfully",
+      ok: true 
+    });
+    
   } catch (err) {
-    console.error("Delete team error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Delete error:", err);
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
@@ -530,7 +585,7 @@ router.post("/teams/:id/assign-routes", auth, requireRole("superadmin"), async (
     // Prevent assigning routes that already belong to another team
     const existing = await Route.find({
       _id: { $in: routeIds },
-      team: { $ne: null }
+      team: { $ne: team._id }
     });
 
     if (existing.length) {
@@ -541,15 +596,10 @@ router.post("/teams/:id/assign-routes", auth, requireRole("superadmin"), async (
     }
 
     // Assign routes → add supervisor
-    await Route.updateMany(
-      { _id: { $in: routeIds } },
-      {
-        $set: {
-          team: team._id,
-          supervisor: team.supervisors[0] || null
-        }
-      }
-    );
+  await Route.updateMany(
+  { _id: { $in: routeIds } },
+  { $set: { team: team._id } }
+);
 
     team.routes = routeIds;
     await team.save();
@@ -569,11 +619,42 @@ router.post("/routes/:id/assign-users", auth, requireRole("supervisor"), async (
     const route = await Route.findById(req.params.id);
     if (!route) return res.status(404).json({ error: "Route not found" });
 
-    // Only supervisor of this team can assign
-    if (String(route.supervisor) !== String(req.user.id)) {
-      return res.status(403).json({ error: "You are not assigned as supervisor for this route" });
+    // ✅ Supervisor must belong to the team of this route
+    const team = await Team.findById(route.team).lean();
+    if (!team) return res.status(404).json({ error: "Team not found" });
+
+    const isSupervisor = (team.supervisors || []).some(
+      (s) => String(s) === String(req.user.id)
+    );
+
+    if (!isSupervisor) {
+      return res.status(403).json({ error: "You are not supervisor of this team" });
     }
 
+
+    // Validate rider
+    if (riderId) {
+      const rider = await User.findById(riderId);
+      if (!rider || rider.role !== "rider") {
+        return res.status(400).json({ error: "Invalid rider" });
+      }
+
+      if (!(team.riders || []).some(r => String(r) === String(riderId))) {
+        return res.status(400).json({ error: "Rider not part of this team" });
+      }
+    }
+
+    // Validate refill
+    if (refillId) {
+      const refill = await User.findById(refillId);
+      if (!refill || refill.role !== "refill") {
+        return res.status(400).json({ error: "Invalid refill coordinator" });
+      }
+
+      if (!(team.refillCoordinators || []).some(r => String(r) === String(refillId))) {
+        return res.status(400).json({ error: "Refill coordinator not part of this team" });
+      }
+    }
     route.rider = riderId || null;
     route.refillCoordinator = refillId || null;
 
@@ -599,6 +680,8 @@ router.get("/routes/list", auth, requireRole("superadmin"), async (_req, res) =>
     res.status(500).json({ error: "Server error" });
   }
 });
+
+
 
 
 
