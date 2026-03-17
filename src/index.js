@@ -25,6 +25,7 @@ import batteryRoutes from "./routes/batteries.js";
 import routeRoutes from "./routes/routes.js";
 import supervisorRoutes from "./routes/supervisor.js";
 import rider from "./routes/rider.js";
+import supervisorInventoryRoutes from "./routes/supervisorInventory.js";
 
 
 
@@ -72,6 +73,7 @@ app.use("/api/routes", routeRoutes);
 
 app.use("/api/supervisor", supervisorRoutes);
 app.use("/api/rider", rider);
+app.use("/api/supervisor-inventory", supervisorInventoryRoutes);
 
 // --- Seed SuperAdmin (from .env) ---
 async function ensureSuperAdmin() {
