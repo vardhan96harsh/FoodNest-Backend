@@ -8,8 +8,9 @@ const UserSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     name: { type: String, required: true, trim: true },
     role: { type: String, enum: roles, required: true },
-    passwordHash: { type: String, required: true },
-    // Optional account status
+    passwordHash: { type: String }, // Optional: Only used for manual authentication
+    googleId: { type: String }, // Used for Google OAuth
+    auth0Id: { type: String }, // Used for Auth0 OAuth
     disabled: { type: Boolean, default: false },
 
     // Payroll / Salary fields (all optional)
@@ -31,13 +32,13 @@ const UserSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Helper to set password
+// Helper to set password for manual authentication
 UserSchema.methods.setPassword = async function (plain) {
   const salt = await bcrypt.genSalt(10);
   this.passwordHash = await bcrypt.hash(plain, salt);
 };
 
-// Helper to verify password
+// Helper to verify password for manual authentication
 UserSchema.methods.verifyPassword = async function (plain) {
   return bcrypt.compare(plain, this.passwordHash);
 };

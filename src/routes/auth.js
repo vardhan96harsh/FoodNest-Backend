@@ -3,7 +3,7 @@ import { User } from "../models/User.js";
 import { RegistrationRequest } from "../models/RegistrationRequest.js";
 import { signToken } from "../utils/jwt.js";
 import { auth } from "../middleware/auth.js";
-
+import passport from "passport"; 
 import { PasswordReset } from "../models/PasswordReset.js";
 import { sendResetOtpEmail } from "../utils/mailer.js";
 import crypto from "crypto";
@@ -12,17 +12,37 @@ import crypto from "crypto";
 const router = express.Router();
 
 /** POST /api/auth/login {email,password} */
+
+/** POST /api/auth/login {email,password} */
 router.post("/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+  const { email, password, provider } = req.body || {};  // Add provider to handle OAuth login
 
-  const user = await User.findOne({ email: String(email).trim().toLowerCase() });
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
-  const ok = await user.verifyPassword(password);
-  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+  if (provider === "google" || provider === "auth0") {
+    // Handle Google/Auth0 login flow
+    passport.authenticate(provider, { session: false }, (err, user, info) => {
+      if (err || !user) {
+        return res.status(400).json({ error: "Invalid credentials" });
+      }
+      const token = signToken(user); // Generate JWT token
+      res.json({
+        token,
+        user: { id: user._id, email: user.email, name: user.name, role: user.role },
+      });
+    })(req, res); // Pass request and response to passport for authentication
+  } else {
+    // Handle manual email/password login
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-  const token = signToken(user);
-  res.json({ token, user: { id: user._id, email: user.email, name: user.name, role: user.role } });
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() });
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+    const ok = await user.verifyPassword(password);
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+    const token = signToken(user);
+    res.json({ token, user: { id: user._id, email: user.email, name: user.name, role: user.role } });
+  }
 });
 
 /** POST /api/auth/register-request {email,name,role,password} */
@@ -184,6 +204,22 @@ router.post("/forgot/reset", async (req, res) => {
 });
 
 
+
+/** Google Callback Route */
+router.get("/google/callback", passport.authenticate("google", { failureRedirect: "/" }),
+  (req, res) => {
+    // Successful login via Google, redirect to dashboard
+    const token = signToken(req.user); // Generate a token for the authenticated user
+    res.json({ token, user: { id: req.user._id, email: req.user.email, name: req.user.name, role: req.user.role } });
+  });
+
+/** Auth0 Callback Route */
+router.get("/auth0/callback", passport.authenticate("auth0", { failureRedirect: "/" }),
+  (req, res) => {
+    // Successful login via Auth0, redirect to dashboard
+    const token = signToken(req.user); // Generate a token for the authenticated user
+    res.json({ token, user: { id: req.user._id, email: req.user.email, name: req.user.name, role: req.user.role } });
+  });
 
 
 export default router;
