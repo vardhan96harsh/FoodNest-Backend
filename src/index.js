@@ -24,6 +24,9 @@ import rider from "./routes/rider.js";
 import supervisorInventoryRoutes from "./routes/supervisorInventory.js";
 import refillRequestsRoutes from "./routes/refillRequests.js";
 import auth0Routes from "./routes/auth0.js";
+import rawMaterialsRouter from './routes/rawMaterials.js';
+
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -112,6 +115,7 @@ app.use("/api/supervisor", supervisorRoutes);
 app.use("/api/rider", rider);
 app.use("/api/supervisor-inventory", supervisorInventoryRoutes);
 app.use("/api/refill-requests", refillRequestsRoutes);
+app.use('/api/raw-materials', rawMaterialsRouter);
 
 // --- Seed SuperAdmin ---
 async function ensureSuperAdmin() {
