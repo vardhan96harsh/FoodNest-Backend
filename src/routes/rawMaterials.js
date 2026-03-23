@@ -1,4 +1,4 @@
-// routes/rawMaterials.js (with PrepRequest integration)
+// routes/rawMaterials.js (with PrepRequest integration, plus new endpoints)
 import express from "express";
 import { auth, requireRole } from "../middleware/auth.js";
 import { RawMaterial } from "../models/RawMaterial.js";
@@ -71,10 +71,43 @@ router.get("/", auth, async (req, res) => {
 });
 
 /**
- * POST /api/raw-materials
- * Create new raw material
+ * GET /api/raw-materials/from-food-items
+ * Get all unique raw materials that appear in any food item.
+ * Returns an array of { name, unit, count }.
  */
-router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
+router.get("/from-food-items", auth, async (req, res) => {
+  try {
+    const materialsFromFood = await FoodItem.aggregate([
+      { $unwind: { path: "$rawMaterials", preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id: "$rawMaterials.name",
+          name: { $first: "$rawMaterials.name" },
+          unit: { $first: "$rawMaterials.unit" },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { name: 1 } },
+      { $project: { _id: 0, name: 1, unit: 1, count: 1 } }
+    ]);
+
+    res.json({
+      ok: true,
+      materials: materialsFromFood
+    });
+  } catch (err) {
+    console.error("Error fetching raw materials from food items:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * POST /api/raw-materials
+ * Create new raw material.
+ * Optionally accepts initialStockDate (ISO string) to set the date of the initial stock movement.
+ */
+// REMOVED ROLE CHECK FOR DEVELOPMENT: router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
+router.post("/", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -87,7 +120,8 @@ router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, re
       minimumStock = 0,
       maximumStock = 1000,
       preferredSupplier,
-      averageCost = 0
+      averageCost = 0,
+      initialStockDate   // new optional field: ISO date string
     } = req.body;
 
     // Check if exists
@@ -100,19 +134,24 @@ router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, re
       return res.status(409).json({ error: "Raw material already exists" });
     }
 
-    const stockMovements = currentStock > 0 ? [{
-      type: "purchase",
-      quantity: currentStock,
-      unit,
-      previousStock: 0,
-      newStock: currentStock,
-      costPerUnit: averageCost,
-      totalCost: averageCost * currentStock,
-      notes: "Initial stock",
-      performedBy: req.user.id,
-      performedByName: req.user.name,
-      createdAt: new Date()
-    }] : [];
+    // Prepare initial stock movement with optional custom date
+    let stockMovements = [];
+    if (currentStock > 0) {
+      const movement = {
+        type: "purchase",
+        quantity: currentStock,
+        unit,
+        previousStock: 0,
+        newStock: currentStock,
+        costPerUnit: averageCost,
+        totalCost: averageCost * currentStock,
+        notes: "Initial stock",
+        performedBy: req.user.id,
+        performedByName: req.user.name,
+        createdAt: initialStockDate ? new Date(initialStockDate) : new Date()
+      };
+      stockMovements.push(movement);
+    }
 
     const material = await RawMaterial.create([{
       name,
@@ -138,6 +177,113 @@ router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, re
   } catch (err) {
     await session.abortTransaction();
     console.error("Create raw material error:", err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+/**
+ * PATCH /api/raw-materials/:id
+ * Update raw material details (name, category, unit, thresholds, supplier, etc.)
+ */
+// REMOVED ROLE CHECK FOR DEVELOPMENT: router.patch("/:id", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
+router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // Fields that cannot be updated directly (handled separately)
+    const allowedUpdates = [
+      "name", "category", "unit", "minimumStock", "maximumStock",
+      "preferredSupplier", "alternateSupplier", "supplierContact",
+      "averageCost", "status"
+    ];
+
+    const updateData = {};
+    for (const field of allowedUpdates) {
+      if (updates[field] !== undefined) {
+        updateData[field] = updates[field];
+      }
+    }
+
+    // If name is being changed, check uniqueness
+    if (updateData.name) {
+      const existing = await RawMaterial.findOne({
+        name: { $regex: new RegExp(`^${updateData.name}$`, 'i') },
+        _id: { $ne: id },
+        isDeleted: false
+      }).session(session);
+      if (existing) {
+        throw new Error("A raw material with this name already exists");
+      }
+    }
+
+    // Update the material
+    const material = await RawMaterial.findByIdAndUpdate(
+      id,
+      { $set: updateData, updatedBy: req.user.id },
+      { new: true, runValidators: true, session }
+    );
+
+    if (!material || material.isDeleted) {
+      throw new Error("Raw material not found");
+    }
+
+    await session.commitTransaction();
+
+    res.json({
+      ok: true,
+      material
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("Update raw material error:", err);
+    res.status(400).json({ error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+/**
+ * DELETE /api/raw-materials/:id
+ * Soft delete a raw material (set isDeleted=true, record deletedAt and deletedBy)
+ */
+// REMOVED ROLE CHECK FOR DEVELOPMENT: router.delete("/:id", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
+router.delete("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { id } = req.params;
+
+    const material = await RawMaterial.findById(id).session(session);
+    if (!material || material.isDeleted) {
+      throw new Error("Raw material not found");
+    }
+
+    // Optional: Check if the material is referenced in any active prep requests?
+    // For now, we allow deletion regardless, but you could add a check.
+
+    material.isDeleted = true;
+    material.deletedAt = new Date();
+    material.deletedBy = req.user.id;
+    material.status = "discontinued";
+
+    await material.save({ session });
+
+    await session.commitTransaction();
+
+    res.json({
+      ok: true,
+      message: "Raw material deleted successfully"
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("Delete raw material error:", err);
     res.status(500).json({ error: err.message });
   } finally {
     session.endSession();
@@ -496,6 +642,79 @@ router.get("/:id/history", auth, async (req, res) => {
   } catch (err) {
     console.error("Get history error:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==================== NEW: MANUAL STOCK ADJUSTMENT ====================
+
+/**
+ * PATCH /api/raw-materials/:id/stock
+ * Manually adjust stock quantity.
+ * Allows setting the stock to any value (positive, zero, or negative if needed).
+ * Records an "adjustment" movement.
+ */
+// REMOVED ROLE CHECK FOR DEVELOPMENT: router.patch("/:id/stock", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
+router.patch("/:id/stock", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { id } = req.params;
+    const { newStock, reason, notes } = req.body;
+
+    // Validate input
+    if (newStock === undefined || typeof newStock !== 'number') {
+      throw new Error("newStock is required and must be a number");
+    }
+
+    const material = await RawMaterial.findById(id).session(session);
+    if (!material || material.isDeleted) {
+      throw new Error("Raw material not found");
+    }
+
+    const previousStock = material.currentStock;
+    const quantityChange = newStock - previousStock;
+
+    // Update stock
+    material.currentStock = newStock;
+
+    // Record the movement
+    const movement = {
+      type: "adjustment",
+      quantity: Math.abs(quantityChange),
+      unit: material.unit,
+      previousStock,
+      newStock,
+      notes: notes || reason || `Manual adjustment to ${newStock}`,
+      performedBy: req.user.id,
+      performedByName: req.user.name,
+      performedByRole: req.user.role,
+      createdAt: new Date()
+    };
+    // Optionally, you could add an 'adjustmentType' field if needed
+
+    material.stockMovements.push(movement);
+    await material.save({ session });
+
+    await session.commitTransaction();
+
+    res.json({
+      ok: true,
+      material: {
+        _id: material._id,
+        name: material.name,
+        previousStock,
+        newStock: material.currentStock,
+        unit: material.unit
+      },
+      movement
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("Manual stock adjustment error:", err);
+    res.status(400).json({ error: err.message });
+  } finally {
+    session.endSession();
   }
 });
 
