@@ -1,14 +1,19 @@
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import path from "path";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, "../../.env") });
 
-import "dotenv/config";  
 import passport from "passport";
 import { Strategy as Auth0Strategy } from "passport-auth0";
 import { User } from "../models/User.js";
-console.log("ENV CHECK:", process.env.AUTH0_CLIENT_ID, process.env.AUTH0_DOMAIN);
+import { RegistrationRequest } from "../models/RegistrationRequest.js";
 
 passport.use(new Auth0Strategy({
-  domain: process.env.AUTH0_DOMAIN,
-  clientID: process.env.AUTH0_CLIENT_ID,
+  domain:      process.env.AUTH0_DOMAIN,
+  clientID:    process.env.AUTH0_CLIENT_ID,
   clientSecret: process.env.AUTH0_CLIENT_SECRET,
   callbackURL: process.env.AUTH0_CALLBACK_URL,
 }, async (accessToken, refreshToken, extraParams, profile, done) => {
@@ -16,32 +21,49 @@ passport.use(new Auth0Strategy({
     const email = profile.emails?.[0]?.value;
     if (!email) return done(new Error("No email from Auth0"), null);
 
-    let user = await User.findOne({ email });
-
-    if (!user) {
-      user = new User({
-        email,
-        name: profile.displayName || email,
-        role: "rider",           // default role — change as needed
-        auth0Id: profile.id,
-      });
-      await user.save();
-    } else if (!user.auth0Id) {
-      // Link Auth0 ID to existing user
-      user.auth0Id = profile.id;
-      await user.save();
+    // 1. Check if approved user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      // Already approved — log them in normally
+      return done(null, { ...existingUser.toObject(), status: "approved" });
     }
 
-    return done(null, user);
+    // 2. Check if pending request already exists
+    const existingRequest = await RegistrationRequest.findOne({ email });
+    if (existingRequest) {
+      // Still pending
+      return done(null, { 
+        status: "pending", 
+        email, 
+        name: existingRequest.name 
+      });
+    }
+
+    // 3. New Google user — create pending registration request
+    const newRequest = new RegistrationRequest({
+      email,
+      name: profile.displayName || email,
+      role: "rider",
+      loginType: "google",
+      googleId: profile.id,
+      auth0Id: profile.id,
+    });
+    await newRequest.save();
+
+    return done(null, { 
+      status: "pending", 
+      email, 
+      name: profile.displayName || email 
+    });
+
   } catch (err) {
     return done(err, null);
   }
 }));
 
-// Needed even without sessions — passport-auth0 requires these
-passport.serializeUser((user, done) => done(null, user._id));
+passport.serializeUser((user, done)   => done(null, user._id || user.email));
 passport.deserializeUser(async (id, done) => {
-  const user = await User.findById(id);
+  const user = await User.findById(id).catch(() => null);
   done(null, user);
 });
 
