@@ -1,21 +1,21 @@
-// routes/rawMaterials.js (with PrepRequest integration, plus new endpoints)
+// routes/rawMaterials.js
 import express from "express";
 import { auth, requireRole } from "../middleware/auth.js";
 import { RawMaterial } from "../models/RawMaterial.js";
 import { FoodItem } from "../models/FoodItem.js";
 import { PrepRequest } from "../models/PrepRequest.js";
-import { Team } from "../models/Team.js";
 import mongoose from "mongoose";
 
 const router = express.Router();
 
 // ==================== HELPER FUNCTIONS ====================
 
-const calculateStockStatus = (current, min, max) => {
-  if (current <= 0) return 'out_of_stock';
-  if (current < min) return 'low';
-  if (current > max) return 'overstock';
-  return 'adequate';
+const escapeRegex = (str = "") =>
+  str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const calculateStockStatus = (current) => {
+  if (current <= 0) return "out_of_stock";
+  return "available";
 };
 
 // ==================== RAW MATERIAL MANAGEMENT ====================
@@ -27,31 +27,29 @@ const calculateStockStatus = (current, min, max) => {
 router.get("/", auth, async (req, res) => {
   try {
     const { category, search, lowStock } = req.query;
-    
-    let query = { isDeleted: false };
-    
+
+    const query = { isDeleted: false };
+
     if (category) query.category = category;
+
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { category: { $regex: search, $options: 'i' } }
+        { name: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
       ];
     }
-    
-    const materials = await RawMaterial.find(query)
-      .sort({ name: 1 })
-      .lean();
 
-    const enhancedMaterials = materials.map(m => ({
+    const materials = await RawMaterial.find(query).sort({ name: 1 }).lean();
+
+    const enhancedMaterials = materials.map((m) => ({
       ...m,
-      stockStatus: calculateStockStatus(m.currentStock, m.minimumStock, m.maximumStock),
-      reorderQuantity: Math.max(0, m.maximumStock - m.currentStock),
-      stockValue: m.currentStock * (m.averageCost || 0)
+      stockStatus: calculateStockStatus(m.currentStock),
+      stockValue: (m.currentStock || 0) * (m.averageCost || 0),
     }));
 
     let result = enhancedMaterials;
-    if (lowStock === 'true') {
-      result = result.filter(m => m.stockStatus === 'low' || m.stockStatus === 'out_of_stock');
+    if (lowStock === "true") {
+      result = result.filter((m) => m.currentStock <= 0);
     }
 
     res.json({
@@ -59,11 +57,9 @@ router.get("/", auth, async (req, res) => {
       items: result,
       summary: {
         totalItems: result.length,
-        lowStockCount: result.filter(m => m.stockStatus === 'low').length,
-        outOfStockCount: result.filter(m => m.stockStatus === 'out_of_stock').length
-      }
+        outOfStockCount: result.filter((m) => m.currentStock <= 0).length,
+      },
     });
-
   } catch (err) {
     console.error("Get raw materials error:", err);
     res.status(500).json({ error: "Server error" });
@@ -81,19 +77,22 @@ router.get("/from-food-items", auth, async (req, res) => {
       { $unwind: { path: "$rawMaterials", preserveNullAndEmptyArrays: false } },
       {
         $group: {
-          _id: "$rawMaterials.name",
+          _id: {
+            name: { $toLower: "$rawMaterials.name" },
+            unit: "$rawMaterials.unit",
+          },
           name: { $first: "$rawMaterials.name" },
           unit: { $first: "$rawMaterials.unit" },
-          count: { $sum: 1 }
-        }
+          count: { $sum: 1 },
+        },
       },
       { $sort: { name: 1 } },
-      { $project: { _id: 0, name: 1, unit: 1, count: 1 } }
+      { $project: { _id: 0, name: 1, unit: 1, count: 1 } },
     ]);
 
     res.json({
       ok: true,
-      materials: materialsFromFood
+      materials: materialsFromFood,
     });
   } catch (err) {
     console.error("Error fetching raw materials from food items:", err);
@@ -103,81 +102,176 @@ router.get("/from-food-items", auth, async (req, res) => {
 
 /**
  * POST /api/raw-materials
- * Create new raw material.
- * Optionally accepts initialStockDate (ISO string) to set the date of the initial stock movement.
+ * Add stock from food-item raw material list.
+ *
+ * Expected body:
+ * {
+ *   "name": "Tomato",
+ *   "qty": 5,
+ *   "averageCost": 20,
+ *   "preferredSupplier": "ABC Supplier",
+ *   "initialStockDate": "2026-03-23T10:00:00.000Z"
+ * }
+ *
+ * Flow:
+ * - name must come from FoodItem.rawMaterials
+ * - if raw material already exists in inventory => add qty
+ * - if not exists => create raw material in inventory and set qty
  */
-// REMOVED ROLE CHECK FOR DEVELOPMENT: router.post("/", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
-router.post("/", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+router.post("/", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const {
-      name,
-      category,
-      unit,
-      currentStock = 0,
-      minimumStock = 0,
-      maximumStock = 1000,
-      preferredSupplier,
-      averageCost = 0,
-      initialStockDate   // new optional field: ISO date string
-    } = req.body;
+    const { name, qty, averageCost = 0, preferredSupplier, initialStockDate } =
+      req.body;
 
-    // Check if exists
-    const existing = await RawMaterial.findOne({ 
-      name: { $regex: new RegExp(`^${name}$`, 'i') },
-      isDeleted: false 
+    if (!name || !name.trim()) {
+      throw new Error("Raw material name is required");
+    }
+
+    const parsedQty = Number(qty);
+    const parsedAverageCost = Number(averageCost || 0);
+
+    if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+      throw new Error("qty must be a valid number greater than 0");
+    }
+
+    if (!Number.isFinite(parsedAverageCost) || parsedAverageCost < 0) {
+      throw new Error(
+        "averageCost must be a valid number greater than or equal to 0"
+      );
+    }
+
+    const stockDate = initialStockDate ? new Date(initialStockDate) : new Date();
+    if (isNaN(stockDate.getTime())) {
+      throw new Error("initialStockDate is invalid");
+    }
+
+    const safeName = escapeRegex(name.trim());
+
+    // Find selected raw material from FoodItem.rawMaterials
+    const materialFromFood = await FoodItem.aggregate([
+      { $unwind: "$rawMaterials" },
+      {
+        $match: {
+          "rawMaterials.name": { $regex: new RegExp(`^${safeName}$`, "i") },
+        },
+      },
+      {
+        $group: {
+          _id: { $toLower: "$rawMaterials.name" },
+          name: { $first: "$rawMaterials.name" },
+          unit: { $first: "$rawMaterials.unit" },
+        },
+      },
+      { $limit: 1 },
+    ]).session(session);
+
+    if (!materialFromFood.length) {
+      throw new Error("Selected raw material was not found in food items");
+    }
+
+    const selectedMaterial = materialFromFood[0];
+    const selectedSafeName = escapeRegex(selectedMaterial.name);
+
+    // Check existing inventory
+    const existing = await RawMaterial.findOne({
+      name: { $regex: new RegExp(`^${selectedSafeName}$`, "i") },
+      isDeleted: false,
     }).session(session);
 
+    // Already exists => add stock only
     if (existing) {
-      return res.status(409).json({ error: "Raw material already exists" });
-    }
+      const previousStock = existing.currentStock || 0;
+      existing.currentStock = previousStock + parsedQty;
 
-    // Prepare initial stock movement with optional custom date
-    let stockMovements = [];
-    if (currentStock > 0) {
-      const movement = {
+      existing.stockMovements.push({
         type: "purchase",
-        quantity: currentStock,
-        unit,
-        previousStock: 0,
-        newStock: currentStock,
-        costPerUnit: averageCost,
-        totalCost: averageCost * currentStock,
-        notes: "Initial stock",
+        quantity: parsedQty,
+        unit: existing.unit || selectedMaterial.unit || "unit",
+        previousStock,
+        newStock: existing.currentStock,
+        costPerUnit: parsedAverageCost,
+        totalCost: parsedAverageCost * parsedQty,
+        supplier: preferredSupplier,
+        notes: "Stock added from food item raw material list",
         performedBy: req.user.id,
         performedByName: req.user.name,
-        createdAt: initialStockDate ? new Date(initialStockDate) : new Date()
-      };
-      stockMovements.push(movement);
+        createdAt: stockDate,
+      });
+
+      if (!existing.unit && selectedMaterial.unit) {
+        existing.unit = selectedMaterial.unit;
+      }
+
+      if (preferredSupplier) {
+        existing.preferredSupplier = preferredSupplier;
+      }
+
+      if (parsedAverageCost > 0) {
+        existing.lastPurchaseCost = parsedAverageCost;
+        existing.averageCost = parsedAverageCost;
+        existing.lastPurchaseDate = stockDate;
+      }
+
+      await existing.save({ session });
+      await session.commitTransaction();
+
+      return res.json({
+        ok: true,
+        message: "Stock added successfully",
+        material: existing,
+      });
     }
 
-    const material = await RawMaterial.create([{
-      name,
-      category: category || "Other",
-      unit,
-      currentStock,
-      minimumStock,
-      maximumStock,
-      preferredSupplier,
-      averageCost,
-      lastPurchaseCost: averageCost,
-      stockMovements,
-      createdBy: req.user.id
-    }], { session });
+    // Not exists => create inventory item from food item material
+    const stockMovements = [
+      {
+        type: "purchase",
+        quantity: parsedQty,
+        unit: selectedMaterial.unit || "unit",
+        previousStock: 0,
+        newStock: parsedQty,
+        costPerUnit: parsedAverageCost,
+        totalCost: parsedAverageCost * parsedQty,
+        supplier: preferredSupplier,
+        notes: "Created from food item raw material list",
+        performedBy: req.user.id,
+        performedByName: req.user.name,
+        createdAt: stockDate,
+      },
+    ];
+
+    const material = await RawMaterial.create(
+      [
+        {
+          name: selectedMaterial.name,
+          unit: selectedMaterial.unit || "unit",
+          category: "Other",
+          currentStock: parsedQty,
+          preferredSupplier,
+          averageCost: parsedAverageCost,
+          lastPurchaseCost: parsedAverageCost,
+          lastPurchaseDate: stockDate,
+          stockMovements,
+          createdBy: req.user.id,
+        },
+      ],
+      { session }
+    );
 
     await session.commitTransaction();
 
     res.status(201).json({
       ok: true,
-      material: material[0]
+      message: "Raw material added to inventory successfully",
+      material: material[0],
     });
-
   } catch (err) {
     await session.abortTransaction();
-    console.error("Create raw material error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("Add stock from food material list error:", err);
+    res.status(400).json({ error: err.message });
   } finally {
     session.endSession();
   }
@@ -185,10 +279,9 @@ router.post("/", auth, /* requireRole(["superadmin", "supervisor"]), */ async (r
 
 /**
  * PATCH /api/raw-materials/:id
- * Update raw material details (name, category, unit, thresholds, supplier, etc.)
+ * Update raw material details only (not stock)
  */
-// REMOVED ROLE CHECK FOR DEVELOPMENT: router.patch("/:id", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
-router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+router.patch("/:id", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -196,11 +289,15 @@ router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asyn
     const { id } = req.params;
     const updates = req.body;
 
-    // Fields that cannot be updated directly (handled separately)
     const allowedUpdates = [
-      "name", "category", "unit", "minimumStock", "maximumStock",
-      "preferredSupplier", "alternateSupplier", "supplierContact",
-      "averageCost", "status"
+      "name",
+      "category",
+      "unit",
+      "preferredSupplier",
+      "alternateSupplier",
+      "supplierContact",
+      "averageCost",
+      "status",
     ];
 
     const updateData = {};
@@ -210,26 +307,28 @@ router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asyn
       }
     }
 
-    // If name is being changed, check uniqueness
     if (updateData.name) {
+      const safeName = escapeRegex(updateData.name.trim());
       const existing = await RawMaterial.findOne({
-        name: { $regex: new RegExp(`^${updateData.name}$`, 'i') },
+        name: { $regex: new RegExp(`^${safeName}$`, "i") },
         _id: { $ne: id },
-        isDeleted: false
+        isDeleted: false,
       }).session(session);
+
       if (existing) {
         throw new Error("A raw material with this name already exists");
       }
+
+      updateData.name = updateData.name.trim();
     }
 
-    // Update the material
-    const material = await RawMaterial.findByIdAndUpdate(
-      id,
-      { $set: updateData, updatedBy: req.user.id },
+    const material = await RawMaterial.findOneAndUpdate(
+      { _id: id, isDeleted: false },
+      { $set: { ...updateData, updatedBy: req.user.id } },
       { new: true, runValidators: true, session }
     );
 
-    if (!material || material.isDeleted) {
+    if (!material) {
       throw new Error("Raw material not found");
     }
 
@@ -237,7 +336,7 @@ router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asyn
 
     res.json({
       ok: true,
-      material
+      material,
     });
   } catch (err) {
     await session.abortTransaction();
@@ -250,10 +349,9 @@ router.patch("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asyn
 
 /**
  * DELETE /api/raw-materials/:id
- * Soft delete a raw material (set isDeleted=true, record deletedAt and deletedBy)
+ * Soft delete a raw material
  */
-// REMOVED ROLE CHECK FOR DEVELOPMENT: router.delete("/:id", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
-router.delete("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+router.delete("/:id", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -264,9 +362,6 @@ router.delete("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asy
     if (!material || material.isDeleted) {
       throw new Error("Raw material not found");
     }
-
-    // Optional: Check if the material is referenced in any active prep requests?
-    // For now, we allow deletion regardless, but you could add a check.
 
     material.isDeleted = true;
     material.deletedAt = new Date();
@@ -279,7 +374,7 @@ router.delete("/:id", auth, /* requireRole(["superadmin", "supervisor"]), */ asy
 
     res.json({
       ok: true,
-      message: "Raw material deleted successfully"
+      message: "Raw material deleted successfully",
     });
   } catch (err) {
     await session.abortTransaction();
@@ -307,7 +402,7 @@ router.post("/check-food-availability", auth, async (req, res) => {
       return res.json({
         ok: true,
         available: true,
-        message: "No raw materials required"
+        message: "No raw materials required",
       });
     }
 
@@ -316,10 +411,11 @@ router.post("/check-food-availability", auth, async (req, res) => {
 
     for (const rm of foodItem.rawMaterials) {
       const requiredQty = (rm.qty || 1) * quantity;
-      
+      const safeName = escapeRegex(rm.name);
+
       const material = await RawMaterial.findOne({
-        name: { $regex: new RegExp(`^${rm.name}$`, 'i') },
-        isDeleted: false
+        name: { $regex: new RegExp(`^${safeName}$`, "i") },
+        isDeleted: false,
       });
 
       if (!material) {
@@ -327,9 +423,9 @@ router.post("/check-food-availability", auth, async (req, res) => {
         availability.push({
           name: rm.name,
           required: requiredQty,
-          unit: rm.unit || 'unit',
+          unit: rm.unit || "unit",
           available: 0,
-          status: 'not_found'
+          status: "not_found",
         });
         continue;
       }
@@ -343,8 +439,8 @@ router.post("/check-food-availability", auth, async (req, res) => {
         required: requiredQty,
         unit: material.unit,
         available: material.currentStock,
-        status: isAvailable ? 'available' : 'insufficient',
-        remainingAfter: material.currentStock - requiredQty
+        status: isAvailable ? "available" : "insufficient",
+        remainingAfter: material.currentStock - requiredQty,
       });
     }
 
@@ -352,9 +448,8 @@ router.post("/check-food-availability", auth, async (req, res) => {
       ok: true,
       available: allAvailable,
       materials: availability,
-      canProduce: allAvailable ? quantity : 0
+      canProduce: allAvailable ? quantity : 0,
     });
-
   } catch (err) {
     console.error("Check availability error:", err);
     res.status(500).json({ error: err.message });
@@ -365,244 +460,255 @@ router.post("/check-food-availability", auth, async (req, res) => {
  * POST /api/raw-materials/consume-for-prep-request
  * Consume raw materials for a prep request
  */
-router.post("/consume-for-prep-request", auth, requireRole(["supervisor", "cook"]), async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+router.post(
+  "/consume-for-prep-request",
+  auth,
+  requireRole(["supervisor", "cook"]),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-  try {
-    const { prepRequestId, notes } = req.body;
+    try {
+      const { prepRequestId, notes } = req.body;
 
-    // Get prep request
-    const prepRequest = await PrepRequest.findById(prepRequestId)
-      .populate("foodId")
-      .session(session);
+      const prepRequest = await PrepRequest.findById(prepRequestId)
+        .populate("foodId")
+        .session(session);
 
-    if (!prepRequest) {
-      throw new Error("Prep request not found");
-    }
+      if (!prepRequest) {
+        throw new Error("Prep request not found");
+      }
 
-    if (prepRequest.status !== "processing") {
-      throw new Error("Prep request must be in processing state");
-    }
+      if (prepRequest.status !== "processing") {
+        throw new Error("Prep request must be in processing state");
+      }
 
-    if (prepRequest.rawMaterialsConsumed && prepRequest.rawMaterialsConsumed.length > 0) {
-      throw new Error("Materials already consumed for this request");
-    }
+      if (
+        prepRequest.rawMaterialsConsumed &&
+        prepRequest.rawMaterialsConsumed.length > 0
+      ) {
+        throw new Error("Materials already consumed for this request");
+      }
 
-    const foodItem = prepRequest.foodId;
-    const quantityToPrepare = prepRequest.quantityToPrepare || 1;
+      const foodItem = prepRequest.foodId;
+      const quantityToPrepare = prepRequest.quantityToPrepare || 1;
 
-    if (!foodItem.rawMaterials || foodItem.rawMaterials.length === 0) {
-      // No raw materials needed, just mark as consumed
-      prepRequest.materialsConsumedAt = new Date();
+      if (!foodItem.rawMaterials || foodItem.rawMaterials.length === 0) {
+        prepRequest.materialsConsumedAt = new Date();
+        await prepRequest.save({ session });
+        await session.commitTransaction();
+
+        return res.json({
+          ok: true,
+          message: "No raw materials to consume",
+          consumed: [],
+        });
+      }
+
+      const consumed = [];
+      const errors = [];
+      const consumedAt = new Date();
+
+      for (const rm of foodItem.rawMaterials) {
+        const requiredQty = (rm.qty || 1) * quantityToPrepare;
+        const safeName = escapeRegex(rm.name);
+
+        const material = await RawMaterial.findOne({
+          name: { $regex: new RegExp(`^${safeName}$`, "i") },
+          isDeleted: false,
+        }).session(session);
+
+        if (!material) {
+          errors.push(`Raw material '${rm.name}' not found`);
+          continue;
+        }
+
+        if (material.currentStock < requiredQty) {
+          errors.push(
+            `Insufficient ${material.name}. Required: ${requiredQty} ${material.unit}, Available: ${material.currentStock} ${material.unit}`
+          );
+          continue;
+        }
+
+        const previousStock = material.currentStock;
+        material.currentStock -= requiredQty;
+
+        const movement = {
+          type: "consumption",
+          quantity: requiredQty,
+          unit: material.unit,
+          previousStock,
+          newStock: material.currentStock,
+          referenceType: "prep_request",
+          referenceId: prepRequest._id,
+          referenceModel: "PrepRequest",
+          foodItemId: foodItem._id,
+          foodItemName: foodItem.name,
+          quantityProduced: quantityToPrepare,
+          performedBy: req.user.id,
+          performedByName: req.user.name,
+          performedByRole: req.user.role,
+          notes: notes || `Consumed for ${quantityToPrepare} x ${foodItem.name}`,
+          createdAt: consumedAt,
+        };
+
+        material.stockMovements.push(movement);
+        await material.save({ session });
+
+        consumed.push({
+          materialId: material._id,
+          name: material.name,
+          quantityConsumed: requiredQty,
+          unit: material.unit,
+          previousStock,
+          newStock: material.currentStock,
+          consumedAt,
+        });
+      }
+
+      if (errors.length > 0) {
+        throw new Error(errors.join("\n"));
+      }
+
+      prepRequest.rawMaterialsConsumed = consumed;
+      prepRequest.materialsConsumedAt = consumedAt;
       await prepRequest.save({ session });
+
       await session.commitTransaction();
-      
-      return res.json({
+
+      res.json({
         ok: true,
-        message: "No raw materials to consume",
-        consumed: []
+        message: "Raw materials consumed successfully",
+        consumed,
+        prepRequest: {
+          _id: prepRequest._id,
+          status: prepRequest.status,
+          materialsConsumedAt: prepRequest.materialsConsumedAt,
+        },
       });
+    } catch (err) {
+      await session.abortTransaction();
+      console.error("Consume materials error:", err);
+      res.status(500).json({ error: err.message });
+    } finally {
+      session.endSession();
     }
-
-    // Calculate and consume each material
-    const consumed = [];
-    const errors = [];
-
-    for (const rm of foodItem.rawMaterials) {
-      const requiredQty = (rm.qty || 1) * quantityToPrepare;
-      
-      const material = await RawMaterial.findOne({
-        name: { $regex: new RegExp(`^${rm.name}$`, 'i') },
-        isDeleted: false
-      }).session(session);
-
-      if (!material) {
-        errors.push(`Raw material '${rm.name}' not found`);
-        continue;
-      }
-
-      if (material.currentStock < requiredQty) {
-        errors.push(`Insufficient ${material.name}. Required: ${requiredQty} ${material.unit}, Available: ${material.currentStock} ${material.unit}`);
-        continue;
-      }
-
-      const previousStock = material.currentStock;
-      material.currentStock -= requiredQty;
-
-      const movement = {
-        type: "consumption",
-        quantity: requiredQty,
-        unit: material.unit,
-        previousStock,
-        newStock: material.currentStock,
-        referenceType: "prep_request",
-        referenceId: prepRequest._id,
-        referenceModel: "PrepRequest",
-        foodItemId: foodItem._id,
-        foodItemName: foodItem.name,
-        quantityProduced: quantityToPrepare,
-        performedBy: req.user.id,
-        performedByName: req.user.name,
-        performedByRole: req.user.role,
-        notes: notes || `Consumed for ${quantityToPrepare} x ${foodItem.name}`,
-        createdAt: new Date()
-      };
-
-      material.stockMovements.push(movement);
-      await material.save({ session });
-
-      consumed.push({
-        materialId: material._id,
-        name: material.name,
-        quantityConsumed: requiredQty,
-        unit: material.unit,
-        previousStock,
-        newStock: material.currentStock,
-        consumedAt: new Date()
-      });
-    }
-
-    if (errors.length > 0) {
-      throw new Error(errors.join('\n'));
-    }
-
-    // Update prep request
-    prepRequest.rawMaterialsConsumed = consumed;
-    prepRequest.materialsConsumedAt = new Date();
-    await prepRequest.save({ session });
-
-    await session.commitTransaction();
-
-    res.json({
-      ok: true,
-      message: "Raw materials consumed successfully",
-      consumed,
-      prepRequest: {
-        _id: prepRequest._id,
-        status: prepRequest.status,
-        materialsConsumedAt: prepRequest.materialsConsumedAt
-      }
-    });
-
-  } catch (err) {
-    await session.abortTransaction();
-    console.error("Consume materials error:", err);
-    res.status(500).json({ error: err.message });
-  } finally {
-    session.endSession();
   }
-});
+);
 
 /**
  * POST /api/raw-materials/bulk-purchase
  * Add stock for multiple materials
  */
-router.post("/bulk-purchase", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+router.post(
+  "/bulk-purchase",
+  auth,
+  requireRole(["superadmin", "supervisor"]),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-  try {
-    const { items, supplier, invoiceNo, notes } = req.body;
+    try {
+      const { items, supplier, invoiceNo, notes } = req.body;
 
-    const results = [];
+      const results = [];
 
-    for (const item of items) {
-      const { materialId, quantity, costPerUnit } = item;
+      for (const item of items) {
+        const { materialId, quantity, costPerUnit } = item;
 
-      const material = await RawMaterial.findById(materialId).session(session);
-      
-      if (!material) {
-        throw new Error(`Material ${materialId} not found`);
+        const material = await RawMaterial.findById(materialId).session(session);
+        if (!material || material.isDeleted) {
+          throw new Error(`Material ${materialId} not found`);
+        }
+
+        const previousStock = material.currentStock || 0;
+        material.currentStock += quantity;
+
+        if (costPerUnit !== undefined && costPerUnit !== null) {
+          material.lastPurchaseCost = costPerUnit;
+          material.lastPurchaseDate = new Date();
+          material.lastPurchaseSupplier = supplier;
+
+          const totalValue =
+            (material.averageCost || 0) * previousStock + costPerUnit * quantity;
+          material.averageCost =
+            material.currentStock > 0 ? totalValue / material.currentStock : 0;
+        }
+
+        const movement = {
+          type: "purchase",
+          quantity,
+          unit: material.unit,
+          previousStock,
+          newStock: material.currentStock,
+          costPerUnit,
+          totalCost:
+            costPerUnit !== undefined && costPerUnit !== null
+              ? costPerUnit * quantity
+              : undefined,
+          supplier,
+          invoiceNo,
+          notes,
+          performedBy: req.user.id,
+          performedByName: req.user.name,
+          createdAt: new Date(),
+        };
+
+        material.stockMovements.push(movement);
+        await material.save({ session });
+
+        results.push({
+          materialId: material._id,
+          name: material.name,
+          previousStock,
+          newStock: material.currentStock,
+          quantity,
+        });
       }
 
-      const previousStock = material.currentStock;
-      material.currentStock += quantity;
+      await session.commitTransaction();
 
-      if (costPerUnit) {
-        material.lastPurchaseCost = costPerUnit;
-        material.lastPurchaseDate = new Date();
-        material.lastPurchaseSupplier = supplier;
-        
-        // Update average cost
-        const totalValue = (material.averageCost * previousStock) + (costPerUnit * quantity);
-        material.averageCost = totalValue / material.currentStock;
-      }
-
-      const movement = {
-        type: "purchase",
-        quantity,
-        unit: material.unit,
-        previousStock,
-        newStock: material.currentStock,
-        costPerUnit,
-        totalCost: costPerUnit ? costPerUnit * quantity : undefined,
-        supplier,
-        invoiceNo,
-        notes,
-        performedBy: req.user.id,
-        performedByName: req.user.name,
-        createdAt: new Date()
-      };
-
-      material.stockMovements.push(movement);
-      await material.save({ session });
-
-      results.push({
-        materialId: material._id,
-        name: material.name,
-        previousStock,
-        newStock: material.currentStock,
-        quantity
+      res.json({
+        ok: true,
+        message: "Bulk purchase completed",
+        items: results,
       });
+    } catch (err) {
+      await session.abortTransaction();
+      console.error("Bulk purchase error:", err);
+      res.status(500).json({ error: err.message });
+    } finally {
+      session.endSession();
     }
-
-    await session.commitTransaction();
-
-    res.json({
-      ok: true,
-      message: "Bulk purchase completed",
-      items: results
-    });
-
-  } catch (err) {
-    await session.abortTransaction();
-    console.error("Bulk purchase error:", err);
-    res.status(500).json({ error: err.message });
-  } finally {
-    session.endSession();
   }
-});
+);
 
 /**
  * GET /api/raw-materials/low-stock-alerts
- * Get all low stock materials
+ * For your current flow without minimum/maximum,
+ * treat currentStock <= 0 as alert
  */
 router.get("/low-stock-alerts", auth, async (req, res) => {
   try {
     const materials = await RawMaterial.find({
       isDeleted: false,
-      $expr: { $lt: ["$currentStock", "$minimumStock"] }
+      currentStock: { $lte: 0 },
     }).lean();
 
-    const alerts = materials.map(m => ({
+    const alerts = materials.map((m) => ({
       _id: m._id,
       name: m.name,
       currentStock: m.currentStock,
-      minimumStock: m.minimumStock,
       unit: m.unit,
-      shortage: m.minimumStock - m.currentStock,
-      reorderQuantity: m.maximumStock - m.currentStock,
       category: m.category,
-      preferredSupplier: m.preferredSupplier
+      preferredSupplier: m.preferredSupplier,
     }));
 
     res.json({
       ok: true,
       count: alerts.length,
-      alerts
+      alerts,
     });
-
   } catch (err) {
     console.error("Low stock alerts error:", err);
     res.status(500).json({ error: "Server error" });
@@ -616,9 +722,9 @@ router.get("/low-stock-alerts", auth, async (req, res) => {
 router.get("/:id/history", auth, async (req, res) => {
   try {
     const { limit = 50 } = req.query;
-    
+
     const material = await RawMaterial.findById(req.params.id)
-      .select("name unit currentStock stockMovements")
+      .select("name unit currentStock stockMovements isDeleted")
       .lean();
 
     if (!material || material.isDeleted) {
@@ -626,7 +732,6 @@ router.get("/:id/history", auth, async (req, res) => {
     }
 
     let movements = material.stockMovements || [];
-    
     movements = movements
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .slice(0, Number(limit));
@@ -636,35 +741,49 @@ router.get("/:id/history", auth, async (req, res) => {
       materialName: material.name,
       unit: material.unit,
       currentStock: material.currentStock,
-      history: movements
+      history: movements,
     });
-
   } catch (err) {
     console.error("Get history error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ==================== NEW: MANUAL STOCK ADJUSTMENT ====================
-
 /**
  * PATCH /api/raw-materials/:id/stock
- * Manually adjust stock quantity.
- * Allows setting the stock to any value (positive, zero, or negative if needed).
- * Records an "adjustment" movement.
+ * Add more stock to an existing raw material by qty
+ *
+ * Expected body:
+ * {
+ *   "qty": 3,
+ *   "reason": "restock",
+ *   "notes": "added more stock",
+ *   "averageCost": 25
+ * }
  */
-// REMOVED ROLE CHECK FOR DEVELOPMENT: router.patch("/:id/stock", auth, requireRole(["superadmin", "supervisor"]), async (req, res) => {
-router.patch("/:id/stock", auth, /* requireRole(["superadmin", "supervisor"]), */ async (req, res) => {
+router.patch("/:id/stock", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
     const { id } = req.params;
-    const { newStock, reason, notes } = req.body;
+    const { qty, reason, notes, averageCost } = req.body;
 
-    // Validate input
-    if (newStock === undefined || typeof newStock !== 'number') {
-      throw new Error("newStock is required and must be a number");
+    const parsedQty = Number(qty);
+    const parsedAverageCost =
+      averageCost !== undefined ? Number(averageCost) : undefined;
+
+    if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+      throw new Error("qty is required and must be a number greater than 0");
+    }
+
+    if (
+      parsedAverageCost !== undefined &&
+      (!Number.isFinite(parsedAverageCost) || parsedAverageCost < 0)
+    ) {
+      throw new Error(
+        "averageCost must be a valid number greater than or equal to 0"
+      );
     }
 
     const material = await RawMaterial.findById(id).session(session);
@@ -672,46 +791,51 @@ router.patch("/:id/stock", auth, /* requireRole(["superadmin", "supervisor"]), *
       throw new Error("Raw material not found");
     }
 
-    const previousStock = material.currentStock;
-    const quantityChange = newStock - previousStock;
+    const previousStock = material.currentStock || 0;
+    material.currentStock = previousStock + parsedQty;
 
-    // Update stock
-    material.currentStock = newStock;
-
-    // Record the movement
     const movement = {
-      type: "adjustment",
-      quantity: Math.abs(quantityChange),
+      type: "purchase",
+      quantity: parsedQty,
       unit: material.unit,
       previousStock,
-      newStock,
-      notes: notes || reason || `Manual adjustment to ${newStock}`,
+      newStock: material.currentStock,
+      costPerUnit: parsedAverageCost,
+      totalCost:
+        parsedAverageCost !== undefined ? parsedAverageCost * parsedQty : undefined,
+      notes: notes || reason || `Stock added: ${parsedQty}`,
       performedBy: req.user.id,
       performedByName: req.user.name,
       performedByRole: req.user.role,
-      createdAt: new Date()
+      createdAt: new Date(),
     };
-    // Optionally, you could add an 'adjustmentType' field if needed
 
     material.stockMovements.push(movement);
-    await material.save({ session });
 
+    if (parsedAverageCost !== undefined) {
+      material.lastPurchaseCost = parsedAverageCost;
+      material.averageCost = parsedAverageCost;
+      material.lastPurchaseDate = new Date();
+    }
+
+    await material.save({ session });
     await session.commitTransaction();
 
     res.json({
       ok: true,
+      message: "Stock added successfully",
       material: {
         _id: material._id,
         name: material.name,
         previousStock,
         newStock: material.currentStock,
-        unit: material.unit
+        unit: material.unit,
       },
-      movement
+      movement,
     });
   } catch (err) {
     await session.abortTransaction();
-    console.error("Manual stock adjustment error:", err);
+    console.error("Add stock by id error:", err);
     res.status(400).json({ error: err.message });
   } finally {
     session.endSession();

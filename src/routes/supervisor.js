@@ -78,7 +78,6 @@ router.get("/my-team", auth, requireRole("supervisor"), async (req, res) => {
         { 
           path: "riders", 
           select: "name email role status",
-          // Mark riders as Active if they have an active assignment
           transform: (doc) => {
             if (doc && assignedRiderIds.includes(doc._id.toString())) {
               doc.status = 'Active';
@@ -91,13 +90,11 @@ router.get("/my-team", auth, requireRole("supervisor"), async (req, res) => {
         { 
           path: "vehicles", 
           select: "name registrationNo status type",
-          // Filter out vehicles that are in active assignments
           match: { _id: { $nin: assignedVehicleIds } }
         },
         { 
           path: "batteries", 
           select: "imei status type capacity charge health",
-          // Filter out batteries that are in active assignments
           match: { _id: { $nin: assignedBatteryIds } }
         },
         {
@@ -145,7 +142,7 @@ router.get("/my-team", auth, requireRole("supervisor"), async (req, res) => {
         _id: String(v._id), 
         registrationNo: v.registrationNo, 
         type: v.type || 'Cart',
-        status: 'Available' // Since we filtered out assigned ones
+        status: 'Available'
       })) || [],
       batteries: populatedTeam.batteries?.map(b => ({ 
         _id: String(b._id), 
@@ -164,7 +161,6 @@ router.get("/my-team", auth, requireRole("supervisor"), async (req, res) => {
         refillCoordinator: r.refillCoordinator ? { _id: String(r.refillCoordinator._id), name: r.refillCoordinator.name } : null,
         status: r.status || 'Available'
       })) || [],
-      // Include active assignments info for reference
       activeAssignments: activeAssignments.map(a => ({
         vehicleId: a.vehicle,
         batteryId: a.battery,
@@ -190,7 +186,6 @@ router.get("/assignments/available-items", auth, requireRole("supervisor"), asyn
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Get today's inventory
     const inventory = await SupervisorInventory.findOne({
       supervisor: supervisorId,
       date: today
@@ -210,7 +205,6 @@ router.get("/assignments/available-items", auth, requireRole("supervisor"), asyn
       });
     }
 
-    // Calculate available quantities (total - locked)
     const availableItems = inventory.items
       .map(item => {
         const available = item.quantity - (item.locked || 0);
@@ -225,7 +219,7 @@ router.get("/assignments/available-items", auth, requireRole("supervisor"), asyn
           imageUrl: item.foodItem.imageUrl
         };
       })
-      .filter(item => item.available > 0); // Only show items with stock
+      .filter(item => item.available > 0);
 
     res.json({
       ok: true,
@@ -268,7 +262,6 @@ router.get("/assignments/today", auth, requireRole("supervisor"), async (req, re
     .populate("inventory.foodItem", "name price")
     .sort({ createdAt: -1 });
 
-    // Calculate summary
     const summary = {
       total: assignments.length,
       totalItemsAssigned: assignments.reduce(
@@ -357,7 +350,7 @@ router.post(
         throw new Error(`Resource(s) already assigned today: ${conflicts.join(', ')}`);
       }
 
-      // 4. Validate route exists
+      // 4. Validate route exists and get stops
       const route = await Route.findById(routeId).session(session);
       if (!route) {
         throw new Error("Route not found");
@@ -416,7 +409,18 @@ router.post(
         inventoryItem.locked = (inventoryItem.locked || 0) + requestedItem.quantity;
       }
 
-      // 7. Create the assignment
+      // 7. Format stops properly with address and sales tracking
+      const formattedStops = (route.stops || []).map(stop => ({
+        stopName: stop.name || (typeof stop === 'string' ? stop : 'Unnamed Stop'),
+        address: stop.address || '',
+        status: "pending",
+        arrivedAt: null,
+        completedAt: null,
+        durationMinutes: 0,
+        sales: { items: [], totalRevenue: 0, totalItems: 0 }
+      }));
+
+      // 8. Create the assignment with pending status (not active)
       const [assignment] = await DailyAssignment.create([{
         date: today,
         team: team._id,
@@ -427,21 +431,20 @@ router.post(
         battery: batteryId,
         refillCoordinator: refillCoordinatorId,
         inventory: assignmentItems,
-        stops: route.stops?.map(stop => ({
-          stopName: stop.name || stop,
-          status: "pending"
-        })) || [],
-        status: "active",
-        createdBy: supervisorId
+        stops: formattedStops,
+        status: "pending", // Changed from "active" to "pending" - rider must accept first
+        createdBy: supervisorId,
+        startTime: null,
+        endTime: null
       }], { session });
 
-      // 8. Save inventory changes
+      // 9. Save inventory changes
       await inventory.save({ session });
 
-      // 9. Commit the transaction
+      // 10. Commit the transaction
       await session.commitTransaction();
 
-      // 10. Return success with assignment details
+      // 11. Return success with assignment details
       const populatedAssignment = await DailyAssignment.findById(assignment._id)
         .populate("rider", "name email")
         .populate("vehicle", "registrationNo")
@@ -451,7 +454,7 @@ router.post(
 
       res.json({
         ok: true,
-        message: "Assignment created successfully",
+        message: "Assignment created successfully and pending rider acceptance",
         assignmentId: assignment._id,
         assignment: populatedAssignment
       });
@@ -479,7 +482,7 @@ router.post(
 
 /**
  * POST /api/supervisor/assignments/:id/start
- * Rider starts assignment
+ * Rider starts assignment (kept for compatibility)
  */
 router.post("/assignments/:id/start", auth, requireRole("rider"), async (req, res) => {
   try {
@@ -490,8 +493,11 @@ router.post("/assignments/:id/start", auth, requireRole("rider"), async (req, re
       return res.status(403).json({ error: "Not your assignment" });
     }
 
+    if (assignment.status !== "active") {
+      return res.status(400).json({ error: "Assignment must be accepted before starting" });
+    }
+
     assignment.startTime = new Date();
-    assignment.status = "active";
     await assignment.save();
 
     res.json({ ok: true, assignment });
@@ -500,8 +506,6 @@ router.post("/assignments/:id/start", auth, requireRole("rider"), async (req, re
     res.status(500).json({ error: "Server error" });
   }
 });
-
-
 
 /**
  * POST /api/supervisor/assignments/:id/close
@@ -519,12 +523,10 @@ router.post("/assignments/:id/close", auth, requireRole("supervisor"), async (re
       throw new Error("Assignment not found");
     }
 
-    // Verify supervisor owns this assignment
     if (String(assignment.supervisor) !== req.user.id) {
       throw new Error("Not authorized to close this assignment");
     }
 
-    // Check if already closed
     if (assignment.status === "completed") {
       throw new Error("Assignment is already completed");
     }
@@ -533,7 +535,6 @@ router.post("/assignments/:id/close", auth, requireRole("supervisor"), async (re
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Update inventory - reduce actual stock by sold items and unlock remaining
     const inventory = await SupervisorInventory.findOne({
       supervisor: supervisorId,
       date: today
@@ -550,27 +551,21 @@ router.post("/assignments/:id/close", auth, requireRole("supervisor"), async (re
         
         if (inventoryItem) {
           if (soldQuantity > 0) {
-            // Reduce actual quantity by sold amount
             inventoryItem.quantity -= soldQuantity;
           }
           
-          // Unlock all assigned items (both sold and unsold)
-          // Because sold items are already deducted from quantity
-          // and unsold items should be available again
           inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - assignedQuantity);
         }
       }
       await inventory.save({ session });
     }
 
-    // Update assignment status
     assignment.status = "completed";
     assignment.endTime = new Date();
     assignment.closedAt = new Date();
     assignment.closedBy = req.user.id;
     assignment.inventoryReturned = true;
     
-    // Calculate final totals
     assignment.totalItemsSold = assignment.inventory.reduce(
       (sum, item) => sum + (item.quantitySold || 0), 0
     );
@@ -610,6 +605,7 @@ router.post("/assignments/:id/close", auth, requireRole("supervisor"), async (re
     session.endSession();
   }
 });
+
 /**
  * GET /api/supervisor/assignments/:id
  * Get single assignment details
@@ -627,7 +623,6 @@ router.get("/assignments/:id", auth, requireRole("supervisor"), async (req, res)
       return res.status(404).json({ error: "Assignment not found" });
     }
 
-    // Verify supervisor owns this assignment
     if (String(assignment.supervisor) !== req.user.id) {
       return res.status(403).json({ error: "Not authorized to view this assignment" });
     }
@@ -641,6 +636,7 @@ router.get("/assignments/:id", auth, requireRole("supervisor"), async (req, res)
     res.status(500).json({ error: "Server error" });
   }
 });
+
 /**
  * DELETE /api/supervisor/assignments/:id
  * Delete/cancel assignment and free all resources
@@ -653,7 +649,6 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
     const assignmentId = req.params.id;
     const supervisorId = req.user.id;
 
-    // Find the assignment and verify ownership
     const assignment = await DailyAssignment.findById(assignmentId)
       .session(session);
 
@@ -661,12 +656,10 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
       throw new Error("Assignment not found");
     }
 
-    // Verify supervisor owns this assignment
     if (String(assignment.supervisor) !== supervisorId) {
       throw new Error("Not authorized to delete this assignment");
     }
 
-    // Check if assignment can be deleted (only pending or active assignments can be deleted)
     if (assignment.status === "completed") {
       throw new Error("Cannot delete completed assignments");
     }
@@ -674,43 +667,33 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // STEP 1: FREE UP INVENTORY - Unlock all items
     const inventory = await SupervisorInventory.findOne({
       supervisor: supervisorId,
       date: today
     }).session(session);
 
     if (inventory) {
-      // For each item in the assignment, unlock the quantity
       for (const assignedItem of assignment.inventory) {
         const inventoryItem = inventory.items.find(
           item => String(item.foodItem) === String(assignedItem.foodItem)
         );
         
         if (inventoryItem) {
-          // Reduce the locked quantity by the assigned amount
           inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - assignedItem.quantityAssigned);
         }
       }
       await inventory.save({ session });
     }
 
-    // STEP 2: MARK ASSIGNMENT AS CANCELLED/DELETED
-    // Instead of actually deleting, we'll mark it as cancelled for audit purposes
     assignment.status = "cancelled";
     assignment.endTime = new Date();
     assignment.closedAt = new Date();
     assignment.closedBy = supervisorId;
     assignment.inventoryReturned = true;
-    
-    // Add a field to track deletion reason if needed
     assignment.deletedAt = new Date();
     assignment.deletedBy = supervisorId;
     
     await assignment.save({ session });
-
-    // Alternative: If you want to actually delete instead of soft delete
-    // await DailyAssignment.deleteOne({ _id: assignmentId }).session(session);
 
     await session.commitTransaction();
 
@@ -750,7 +733,7 @@ router.post("/assignments/:id/cancel", auth, requireRole("supervisor"), async (r
   try {
     const assignmentId = req.params.id;
     const supervisorId = req.user.id;
-    const { reason } = req.body; // Optional cancellation reason
+    const { reason } = req.body;
 
     const assignment = await DailyAssignment.findById(assignmentId)
       .session(session);
@@ -770,7 +753,6 @@ router.post("/assignments/:id/cancel", auth, requireRole("supervisor"), async (r
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Free up inventory
     const inventory = await SupervisorInventory.findOne({
       supervisor: supervisorId,
       date: today
@@ -789,7 +771,6 @@ router.post("/assignments/:id/cancel", auth, requireRole("supervisor"), async (r
       await inventory.save({ session });
     }
 
-    // Update assignment status
     assignment.status = "cancelled";
     assignment.endTime = new Date();
     assignment.closedAt = new Date();
