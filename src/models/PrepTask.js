@@ -1,3 +1,4 @@
+// models/PrepTask.js
 import mongoose from "mongoose";
 
 const prepTaskItemSchema = new mongoose.Schema({
@@ -51,11 +52,11 @@ const prepTaskHistorySchema = new mongoose.Schema({
 });
 
 const prepTaskSchema = new mongoose.Schema({
-  // Task identifiers
+  // Task identifiers - Make taskNumber NOT required initially
   taskNumber: {
     type: String,
-    unique: true,
-    required: true
+    unique: true
+    // Remove 'required: true' - it will be generated in pre-save
   },
   
   // Assignment details
@@ -85,6 +86,7 @@ const prepTaskSchema = new mongoose.Schema({
   },
   scheduledTime: {
     type: String,
+    enum: ["Morning", "Afternoon", "Evening"],
     default: "Morning"
   },
   deadline: {
@@ -146,13 +148,27 @@ const prepTaskSchema = new mongoose.Schema({
 
 // Generate task number before saving
 prepTaskSchema.pre("save", async function(next) {
+  // Only generate if taskNumber doesn't exist
   if (!this.taskNumber) {
-    const date = new Date();
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    const count = await mongoose.model("PrepTask").countDocuments();
-    this.taskNumber = `PT-${year}${month}${day}-${String(count + 1).padStart(4, '0')}`;
+    try {
+      const date = new Date();
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const dateStr = `${year}${month}${day}`;
+      
+      // Count documents with today's date prefix
+      const count = await mongoose.model("PrepTask").countDocuments({
+        taskNumber: { $regex: `^PT-${dateStr}` }
+      });
+      
+      this.taskNumber = `PT-${dateStr}-${String(count + 1).padStart(4, '0')}`;
+      console.log(`✅ Generated task number: ${this.taskNumber}`);
+    } catch (err) {
+      console.error("Error generating task number:", err);
+      // Fallback to timestamp-based number
+      this.taskNumber = `PT-${Date.now()}`;
+    }
   }
   next();
 });
