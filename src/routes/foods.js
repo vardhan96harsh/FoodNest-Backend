@@ -96,6 +96,43 @@ router.get("/", async (req, res) => {
   }
 });
 
+
+
+router.get("/permanent", async (req, res) => {
+  try {
+    const docs = await FoodItem.find({ isPermanent: true }).sort({ createdAt: -1 }).lean();
+    
+    console.log(`📦 Found ${docs.length} permanent food items`);
+
+    const fixed = docs.map(d => {
+      let imageUrl = d.imageUrl;
+      
+      if (!imageUrl && d.imagePath) {
+        const base = process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
+        const baseClean = base.replace(/\/$/, '');
+        const cleanPath = d.imagePath.replace(/^\/+/, '');
+        imageUrl = `${baseClean}/uploads/${cleanPath}`;
+      }
+      
+      return {
+        ...d,
+        imageUrl: imageUrl || null,
+        imagePath: d.imagePath || null,
+      };
+    });
+
+    res.json(fixed);
+  } catch (error) {
+    console.error("❌ GET permanent foods error:", error);
+    res.status(500).json({ error: "Failed to fetch permanent food items" });
+  }
+});
+
+
+
+
+
+
 /**
  * GET /api/foods/:id
  */

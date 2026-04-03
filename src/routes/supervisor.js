@@ -1,15 +1,21 @@
 import express from "express";
 import { auth, requireRole } from "../middleware/auth.js";
 import { Team } from "../models/Team.js";
-
 import { Route } from "../models/Route.js";
 import { FoodItem } from "../models/FoodItem.js";
 import { DailyAssignment } from "../models/DailyAssignment.js";
-import { SupervisorInventory } from "../models/SupervisorInventory.js";
+import { PermanentInventory, DailyInventory } from "../models/SupervisorInventory.js";
 import mongoose from "mongoose";
 import { body, validationResult } from "express-validator";
 
 const router = express.Router();
+
+// Helper function to get today's date at midnight
+const getTodayDate = () => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return today;
+};
 
 // Validation middleware
 const validateAssignmentCreate = [
@@ -178,61 +184,140 @@ router.get("/my-team", auth, requireRole("supervisor"), async (req, res) => {
 
 /**
  * GET /api/supervisor/assignments/available-items
- * Get available items from today's inventory for assignment
+ * Get available items from BOTH daily AND permanent inventory for assignment
  */
 router.get("/assignments/available-items", auth, requireRole("supervisor"), async (req, res) => {
   try {
     const supervisorId = req.user.id;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = getTodayDate();
 
-    const inventory = await SupervisorInventory.findOne({
-      supervisor: supervisorId,
-      date: today
-    }).populate({
-      path: "items.foodItem",
-      select: "name price category imageUrl"
-    });
+    console.log(`[Available Items] Fetching for supervisor: ${supervisorId}`);
 
-    if (!inventory) {
-      return res.json({
-        ok: true,
-        items: [],
-        summary: {
-          totalItems: 0,
-          totalAvailable: 0
-        }
+    // Get daily inventory (temporary items)
+    let dailyInventory = null;
+    try {
+      dailyInventory = await DailyInventory.findOne({
+        supervisor: supervisorId,
+        date: today
+      }).populate({
+        path: "items.foodItem",
+        select: "name price category imageUrl unit isPermanent"
       });
+      console.log(`[Available Items] Daily inventory found: ${!!dailyInventory}`);
+    } catch (err) {
+      console.error("[Available Items] Error fetching daily inventory:", err);
     }
 
-    const availableItems = inventory.items
-      .map(item => {
-        const available = item.quantity - (item.locked || 0);
-        return {
-          foodItemId: item.foodItem._id,
-          name: item.foodItem.name,
-          price: item.foodItem.price,
-          category: item.foodItem.category,
-          totalQuantity: item.quantity,
-          locked: item.locked || 0,
-          available: available,
-          imageUrl: item.foodItem.imageUrl
-        };
-      })
-      .filter(item => item.available > 0);
+    // Get permanent inventory
+    let permanentInventory = null;
+    try {
+      permanentInventory = await PermanentInventory.findOne({
+        supervisor: supervisorId,
+      }).populate({
+        path: "items.foodItem",
+        select: "name price category imageUrl unit isPermanent"
+      });
+      console.log(`[Available Items] Permanent inventory found: ${!!permanentInventory}`);
+    } catch (err) {
+      console.error("[Available Items] Error fetching permanent inventory:", err);
+    }
+
+    const allItems = [];
+
+    // Add daily/temporary items
+    if (dailyInventory && dailyInventory.items && Array.isArray(dailyInventory.items)) {
+      for (const item of dailyInventory.items) {
+        try {
+          // Skip if foodItem is missing
+          if (!item.foodItem || !item.foodItem._id) {
+            console.log("[Available Items] Skipping daily item - missing foodItem reference");
+            continue;
+          }
+          
+          if (item.status !== "active") continue;
+          
+          const available = (item.quantity || 0) - (item.locked || 0);
+          if (available <= 0) continue;
+          
+          allItems.push({
+            foodItemId: item.foodItem._id,
+            name: item.foodItem.name || "Unknown",
+            price: item.foodItem.price || 0,
+            category: item.foodItem.category || "Uncategorized",
+            totalQuantity: item.quantity || 0,
+            locked: item.locked || 0,
+            available: available,
+            unit: item.foodItem.unit || "piece",
+            imageUrl: item.foodItem.imageUrl || null,
+            isPermanent: false,
+            source: "daily",
+            inventoryId: dailyInventory._id
+          });
+        } catch (err) {
+          console.error("[Available Items] Error processing daily item:", err);
+        }
+      }
+    }
+
+    // Add permanent items
+    if (permanentInventory && permanentInventory.items && Array.isArray(permanentInventory.items)) {
+      for (const item of permanentInventory.items) {
+        try {
+          // Skip if foodItem is missing
+          if (!item.foodItem || !item.foodItem._id) {
+            console.log("[Available Items] Skipping permanent item - missing foodItem reference");
+            continue;
+          }
+          
+          if (item.status !== "active") continue;
+          
+          const available = (item.quantity || 0) - (item.locked || 0);
+          if (available <= 0) continue;
+          
+          allItems.push({
+            foodItemId: item.foodItem._id,
+            name: item.foodItem.name || "Unknown",
+            price: item.foodItem.price || 0,
+            category: item.foodItem.category || "Uncategorized",
+            totalQuantity: item.quantity || 0,
+            locked: item.locked || 0,
+            available: available,
+            unit: item.foodItem.unit || "piece",
+            imageUrl: item.foodItem.imageUrl || null,
+            isPermanent: true,
+            source: "permanent",
+            inventoryId: permanentInventory._id
+          });
+        } catch (err) {
+          console.error("[Available Items] Error processing permanent item:", err);
+        }
+      }
+    }
+
+    const totalAvailable = allItems.reduce((sum, item) => sum + (item.available || 0), 0);
+    const totalAvailableValue = allItems.reduce((sum, item) => sum + ((item.available || 0) * (item.price || 0)), 0);
+
+    console.log(`[Available Items] Returning ${allItems.length} items`);
 
     res.json({
       ok: true,
-      items: availableItems,
+      items: allItems,
       summary: {
-        totalItems: availableItems.length,
-        totalAvailable: availableItems.reduce((sum, item) => sum + item.available, 0)
+        totalItems: allItems.length,
+        totalAvailable: totalAvailable,
+        totalValue: totalAvailableValue,
+        dailyCount: allItems.filter(i => !i.isPermanent).length,
+        permanentCount: allItems.filter(i => i.isPermanent).length
       }
     });
 
   } catch (err) {
-    console.error("Get available items error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("[Available Items] Fatal error:", err);
+    res.status(500).json({ 
+      ok: false,
+      error: "Server error fetching available items",
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 });
 
@@ -243,8 +328,7 @@ router.get("/assignments/available-items", auth, requireRole("supervisor"), asyn
 router.get("/assignments/today", auth, requireRole("supervisor"), async (req, res) => {
   try {
     const supervisorId = req.user.id;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = getTodayDate();
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
@@ -265,10 +349,10 @@ router.get("/assignments/today", auth, requireRole("supervisor"), async (req, re
     const summary = {
       total: assignments.length,
       totalItemsAssigned: assignments.reduce(
-        (sum, a) => sum + a.inventory.reduce((s, i) => s + i.quantityAssigned, 0), 0
+        (sum, a) => sum + (a.inventory?.reduce((s, i) => s + (i.quantityAssigned || 0), 0) || 0), 0
       ),
       totalValue: assignments.reduce(
-        (sum, a) => sum + a.inventory.reduce((s, i) => s + (i.price * i.quantityAssigned), 0), 0
+        (sum, a) => sum + (a.inventory?.reduce((s, i) => s + ((i.price || 0) * (i.quantityAssigned || 0)), 0) || 0), 0
       )
     };
 
@@ -316,8 +400,7 @@ router.post(
       }
 
       // 2. Get today's date range
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const today = getTodayDate();
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
 
@@ -356,14 +439,18 @@ router.post(
         throw new Error("Route not found");
       }
 
-      // 5. Get today's inventory
-      const inventory = await SupervisorInventory.findOne({
+      // 5. Get today's DAILY inventory and PERMANENT inventory
+      const dailyInventory = await DailyInventory.findOne({
         supervisor: supervisorId,
         date: today
       }).session(session);
 
-      if (!inventory) {
-        throw new Error("No inventory found for today. Please add items to inventory first.");
+      const permanentInventory = await PermanentInventory.findOne({
+        supervisor: supervisorId
+      }).session(session);
+
+      if (!dailyInventory && !permanentInventory) {
+        throw new Error("No inventory found. Please add items to inventory first.");
       }
 
       // 6. Validate all requested items exist in inventory and have sufficient quantity
@@ -380,15 +467,37 @@ router.post(
       for (const requestedItem of items) {
         const foodItem = foods.find(f => String(f._id) === String(requestedItem.foodItemId));
         
-        const inventoryItem = inventory.items.find(
-          item => String(item.foodItem) === String(requestedItem.foodItemId)
-        );
-
-        if (!inventoryItem) {
-          throw new Error(`${foodItem.name} is not in today's inventory`);
+        // Try to find in daily inventory first
+        let inventoryItem = null;
+        let inventorySource = null;
+        let inventoryDoc = null;
+        
+        if (dailyInventory) {
+          inventoryItem = dailyInventory.items.find(
+            item => String(item.foodItem) === String(requestedItem.foodItemId)
+          );
+          if (inventoryItem) {
+            inventorySource = "daily";
+            inventoryDoc = dailyInventory;
+          }
+        }
+        
+        // If not found in daily, check permanent inventory
+        if (!inventoryItem && permanentInventory) {
+          inventoryItem = permanentInventory.items.find(
+            item => String(item.foodItem) === String(requestedItem.foodItemId)
+          );
+          if (inventoryItem) {
+            inventorySource = "permanent";
+            inventoryDoc = permanentInventory;
+          }
         }
 
-        const available = inventoryItem.quantity - (inventoryItem.locked || 0);
+        if (!inventoryItem) {
+          throw new Error(`${foodItem.name} is not in any inventory`);
+        }
+
+        const available = (inventoryItem.quantity || 0) - (inventoryItem.locked || 0);
         
         if (requestedItem.quantity > available) {
           throw new Error(
@@ -397,17 +506,25 @@ router.post(
           );
         }
 
+        // Prepare assignment item with source tracking
         assignmentItems.push({
           foodItem: foodItem._id,
           name: foodItem.name,
           price: foodItem.price,
           quantityAssigned: requestedItem.quantity,
           quantityRemaining: requestedItem.quantity,
-          quantitySold: 0
+          quantitySold: 0,
+          source: inventorySource,
+          inventoryId: inventoryDoc._id
         });
 
+        // Lock inventory for both daily AND permanent items
         inventoryItem.locked = (inventoryItem.locked || 0) + requestedItem.quantity;
       }
+
+      // Save inventory changes
+      if (dailyInventory) await dailyInventory.save({ session });
+      if (permanentInventory) await permanentInventory.save({ session });
 
       // 7. Format stops properly with address and sales tracking
       const formattedStops = (route.stops || []).map(stop => ({
@@ -420,7 +537,7 @@ router.post(
         sales: { items: [], totalRevenue: 0, totalItems: 0 }
       }));
 
-      // 8. Create the assignment with pending status (not active)
+      // 8. Create the assignment with pending status
       const [assignment] = await DailyAssignment.create([{
         date: today,
         team: team._id,
@@ -432,19 +549,16 @@ router.post(
         refillCoordinator: refillCoordinatorId,
         inventory: assignmentItems,
         stops: formattedStops,
-        status: "pending", // Changed from "active" to "pending" - rider must accept first
+        status: "pending",
         createdBy: supervisorId,
         startTime: null,
         endTime: null
       }], { session });
 
-      // 9. Save inventory changes
-      await inventory.save({ session });
-
-      // 10. Commit the transaction
+      // 9. Commit the transaction
       await session.commitTransaction();
 
-      // 11. Return success with assignment details
+      // 10. Return success with assignment details
       const populatedAssignment = await DailyAssignment.findById(assignment._id)
         .populate("rider", "name email")
         .populate("vehicle", "registrationNo")
@@ -532,32 +646,50 @@ router.post("/assignments/:id/close", auth, requireRole("supervisor"), async (re
     }
 
     const supervisorId = assignment.supervisor;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = getTodayDate();
 
-    const inventory = await SupervisorInventory.findOne({
-      supervisor: supervisorId,
-      date: today
-    }).session(session);
-
-    if (inventory) {
-      for (const assignedItem of assignment.inventory) {
-        const soldQuantity = assignedItem.quantitySold || 0;
-        const assignedQuantity = assignedItem.quantityAssigned;
-        
-        const inventoryItem = inventory.items.find(
+    // Process inventory updates for each assigned item
+    for (const assignedItem of assignment.inventory) {
+      const soldQuantity = assignedItem.quantitySold || 0;
+      const assignedQuantity = assignedItem.quantityAssigned;
+      
+      let targetInventory = null;
+      
+      // Find the correct inventory based on source
+      if (assignedItem.source === "daily") {
+        targetInventory = await DailyInventory.findOne({
+          supervisor: supervisorId,
+          date: today
+        }).session(session);
+      } else if (assignedItem.source === "permanent") {
+        targetInventory = await PermanentInventory.findOne({
+          supervisor: supervisorId
+        }).session(session);
+      }
+      
+      if (targetInventory) {
+        const inventoryItem = targetInventory.items.find(
           item => String(item.foodItem) === String(assignedItem.foodItem)
         );
         
         if (inventoryItem) {
-          if (soldQuantity > 0) {
+          // For daily items: deduct sold quantity from inventory
+          if (assignedItem.source === "daily" && soldQuantity > 0) {
             inventoryItem.quantity -= soldQuantity;
+            console.log(`Deducted ${soldQuantity} of ${assignedItem.name} from daily inventory`);
           }
           
+          // For permanent items: don't deduct, just track
+          if (assignedItem.source === "permanent" && soldQuantity > 0) {
+            console.log(`Permanent item ${assignedItem.name} sold - no inventory deduction`);
+          }
+          
+          // Unlock the assigned items (return to available pool for both types)
           inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - assignedQuantity);
+          
+          await targetInventory.save({ session });
         }
       }
-      await inventory.save({ session });
     }
 
     assignment.status = "completed";
@@ -641,6 +773,18 @@ router.get("/assignments/:id", auth, requireRole("supervisor"), async (req, res)
  * DELETE /api/supervisor/assignments/:id
  * Delete/cancel assignment and free all resources
  */
+// In your backend routes file, replace the DELETE endpoint with this:
+
+/**
+ * DELETE /api/supervisor/assignments/:id
+ * Delete/cancel assignment and free all resources
+ */
+// In your backend routes file, replace the DELETE endpoint with this improved version:
+
+/**
+ * DELETE /api/supervisor/assignments/:id
+ * Delete/cancel assignment and free all resources
+ */
 router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -649,6 +793,161 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
     const assignmentId = req.params.id;
     const supervisorId = req.user.id;
 
+    console.log(`[DELETE] Attempting to delete assignment: ${assignmentId}`);
+    console.log(`[DELETE] Supervisor ID: ${supervisorId}`);
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(assignmentId)) {
+      await session.abortTransaction();
+      return res.status(400).json({ error: "Invalid assignment ID format" });
+    }
+
+    const assignment = await DailyAssignment.findById(assignmentId)
+      .session(session);
+
+    if (!assignment) {
+      await session.abortTransaction();
+      console.log(`[DELETE] Assignment not found: ${assignmentId}`);
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    console.log(`[DELETE] Assignment found:`, {
+      id: assignment._id,
+      status: assignment.status,
+      supervisor: assignment.supervisor,
+      userSupervisor: supervisorId
+    });
+
+    // Check authorization
+    if (String(assignment.supervisor) !== String(supervisorId)) {
+      await session.abortTransaction();
+      console.log(`[DELETE] Authorization failed - Supervisor mismatch`);
+      return res.status(403).json({ error: "Not authorized to delete this assignment" });
+    }
+
+    // Allow deletion of pending or active assignments
+    // Only prevent deletion of completed assignments
+    if (assignment.status === "completed") {
+      await session.abortTransaction();
+      console.log(`[DELETE] Cannot delete completed assignment`);
+      return res.status(400).json({ error: "Cannot delete completed assignments. Use close instead." });
+    }
+
+    // If already cancelled, just return success
+    if (assignment.status === "cancelled") {
+      await session.commitTransaction();
+      console.log(`[DELETE] Assignment already cancelled`);
+      return res.json({
+        ok: true,
+        message: "Assignment already cancelled"
+      });
+    }
+
+    const today = getTodayDate();
+    console.log(`[DELETE] Today's date: ${today}`);
+
+    // Process inventory unlocks for each assigned item
+    let unlockedCount = 0;
+    
+    for (const assignedItem of assignment.inventory) {
+      console.log(`[DELETE] Processing item: ${assignedItem.name || assignedItem.foodItem}, source: ${assignedItem.source}`);
+      
+      let targetInventory = null;
+      
+      if (assignedItem.source === "daily") {
+        targetInventory = await DailyInventory.findOne({
+          supervisor: supervisorId,
+          date: today
+        }).session(session);
+        console.log(`[DELETE] Looking for daily inventory: ${!!targetInventory}`);
+      } else if (assignedItem.source === "permanent") {
+        targetInventory = await PermanentInventory.findOne({
+          supervisor: supervisorId
+        }).session(session);
+        console.log(`[DELETE] Looking for permanent inventory: ${!!targetInventory}`);
+      }
+      
+      if (targetInventory && targetInventory.items) {
+        const inventoryItem = targetInventory.items.find(
+          item => String(item.foodItem) === String(assignedItem.foodItem)
+        );
+        
+        if (inventoryItem) {
+          const currentLocked = inventoryItem.locked || 0;
+          const toUnlock = assignedItem.quantityAssigned || 0;
+          inventoryItem.locked = Math.max(0, currentLocked - toUnlock);
+          
+          console.log(`[DELETE] Unlocked ${toUnlock} of ${assignedItem.name} from ${assignedItem.source} inventory. New locked: ${inventoryItem.locked}`);
+          await targetInventory.save({ session });
+          unlockedCount++;
+        } else {
+          console.log(`[DELETE] Inventory item not found for: ${assignedItem.name}`);
+        }
+      } else {
+        console.log(`[DELETE] Target inventory not found for source: ${assignedItem.source}`);
+      }
+    }
+
+    console.log(`[DELETE] Unlocked ${unlockedCount} items`);
+
+    // Update assignment status
+    assignment.status = "cancelled";
+    assignment.endTime = new Date();
+    assignment.closedAt = new Date();
+    assignment.closedBy = supervisorId;
+    assignment.inventoryReturned = true;
+    assignment.cancellationReason = req.body.reason || "Cancelled by supervisor";
+    assignment.deletedAt = new Date();
+    
+    await assignment.save({ session });
+    console.log(`[DELETE] Assignment status updated to: ${assignment.status}`);
+    
+    await session.commitTransaction();
+    console.log(`[DELETE] Transaction committed successfully`);
+
+    res.json({
+      ok: true,
+      message: "Assignment cancelled successfully and resources freed",
+      assignment: {
+        _id: assignment._id,
+        status: assignment.status,
+        cancelledAt: assignment.closedAt
+      }
+    });
+
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("[DELETE] Error details:", err);
+    console.error("[DELETE] Error stack:", err.stack);
+    
+    res.status(500).json({ 
+      ok: false,
+      error: "Server error deleting assignment",
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  } finally {
+    session.endSession();
+  }
+});
+/**
+ * PUT /api/supervisor/assignments/:id
+ * Edit pending assignment (add/remove items, change resources)
+ */
+router.put("/assignments/:id", auth, requireRole("supervisor"), async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const assignmentId = req.params.id;
+    const supervisorId = req.user.id;
+    const {
+      riderId,
+      vehicleId,
+      batteryId,
+      items // array of { foodItemId, quantity }
+    } = req.body;
+
+    // Find the assignment
     const assignment = await DailyAssignment.findById(assignmentId)
       .session(session);
 
@@ -656,55 +955,147 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
       throw new Error("Assignment not found");
     }
 
+    // Check if supervisor owns this assignment
     if (String(assignment.supervisor) !== supervisorId) {
-      throw new Error("Not authorized to delete this assignment");
+      throw new Error("Not authorized to edit this assignment");
     }
 
-    if (assignment.status === "completed") {
-      throw new Error("Cannot delete completed assignments");
+    // Only allow editing of pending assignments
+    if (assignment.status !== "pending") {
+      throw new Error("Can only edit pending assignments");
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = getTodayDate();
 
-    const inventory = await SupervisorInventory.findOne({
-      supervisor: supervisorId,
-      date: today
-    }).session(session);
-
-    if (inventory) {
-      for (const assignedItem of assignment.inventory) {
-        const inventoryItem = inventory.items.find(
+    // First, unlock all currently locked inventory
+    for (const assignedItem of assignment.inventory) {
+      let targetInventory = null;
+      
+      if (assignedItem.source === "daily") {
+        targetInventory = await DailyInventory.findOne({
+          supervisor: supervisorId,
+          date: today
+        }).session(session);
+      } else if (assignedItem.source === "permanent") {
+        targetInventory = await PermanentInventory.findOne({
+          supervisor: supervisorId
+        }).session(session);
+      }
+      
+      if (targetInventory && targetInventory.items) {
+        const inventoryItem = targetInventory.items.find(
           item => String(item.foodItem) === String(assignedItem.foodItem)
         );
         
         if (inventoryItem) {
-          inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - assignedItem.quantityAssigned);
+          inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - (assignedItem.quantityAssigned || 0));
+          await targetInventory.save({ session });
         }
       }
-      await inventory.save({ session });
     }
 
-    assignment.status = "cancelled";
-    assignment.endTime = new Date();
-    assignment.closedAt = new Date();
-    assignment.closedBy = supervisorId;
-    assignment.inventoryReturned = true;
-    assignment.deletedAt = new Date();
-    assignment.deletedBy = supervisorId;
+    // If items are being updated, lock new inventory
+    if (items && items.length > 0) {
+      const foodIds = items.map(i => i.foodItemId);
+      const foods = await FoodItem.find({ _id: { $in: foodIds } }).session(session);
+      
+      const dailyInventory = await DailyInventory.findOne({
+        supervisor: supervisorId,
+        date: today
+      }).session(session);
+      
+      const permanentInventory = await PermanentInventory.findOne({
+        supervisor: supervisorId
+      }).session(session);
+      
+      const newAssignmentItems = [];
+      
+      for (const requestedItem of items) {
+        const foodItem = foods.find(f => String(f._id) === String(requestedItem.foodItemId));
+        
+        let inventoryItem = null;
+        let inventorySource = null;
+        let inventoryDoc = null;
+        
+        if (dailyInventory) {
+          inventoryItem = dailyInventory.items.find(
+            item => String(item.foodItem) === String(requestedItem.foodItemId)
+          );
+          if (inventoryItem) {
+            inventorySource = "daily";
+            inventoryDoc = dailyInventory;
+          }
+        }
+        
+        if (!inventoryItem && permanentInventory) {
+          inventoryItem = permanentInventory.items.find(
+            item => String(item.foodItem) === String(requestedItem.foodItemId)
+          );
+          if (inventoryItem) {
+            inventorySource = "permanent";
+            inventoryDoc = permanentInventory;
+          }
+        }
+        
+        if (!inventoryItem) {
+          throw new Error(`${foodItem?.name || 'Item'} is not in any inventory`);
+        }
+        
+        const available = (inventoryItem.quantity || 0) - (inventoryItem.locked || 0);
+        
+        if (requestedItem.quantity > available) {
+          throw new Error(
+            `Insufficient stock for ${foodItem?.name || 'item'}. ` +
+            `Requested: ${requestedItem.quantity}, Available: ${available}`
+          );
+        }
+        
+        newAssignmentItems.push({
+          foodItem: foodItem._id,
+          name: foodItem.name,
+          price: foodItem.price,
+          quantityAssigned: requestedItem.quantity,
+          quantityRemaining: requestedItem.quantity,
+          quantitySold: 0,
+          source: inventorySource,
+          inventoryId: inventoryDoc._id
+        });
+        
+        inventoryItem.locked = (inventoryItem.locked || 0) + requestedItem.quantity;
+      }
+      
+      if (dailyInventory) await dailyInventory.save({ session });
+      if (permanentInventory) await permanentInventory.save({ session });
+      
+      assignment.inventory = newAssignmentItems;
+    }
     
+    // Update resources if provided
+    if (riderId) assignment.rider = riderId;
+    if (vehicleId) assignment.vehicle = vehicleId;
+    if (batteryId) assignment.battery = batteryId;
+    
+    assignment.updatedAt = new Date();
     await assignment.save({ session });
-
+    
     await session.commitTransaction();
-
+    
+    const updatedAssignment = await DailyAssignment.findById(assignmentId)
+      .populate("rider", "name email")
+      .populate("vehicle", "registrationNo")
+      .populate("battery", "imei")
+      .populate("route", "name")
+      .populate("inventory.foodItem", "name price");
+    
     res.json({
       ok: true,
-      message: "Assignment cancelled successfully and resources freed"
+      message: "Assignment updated successfully",
+      assignment: updatedAssignment
     });
-
+    
   } catch (err) {
     await session.abortTransaction();
-    console.error("Delete assignment error:", err);
+    console.error("Edit assignment error:", err);
     
     if (err.message.includes("not found")) {
       return res.status(404).json({ error: err.message });
@@ -712,11 +1103,14 @@ router.delete("/assignments/:id", auth, requireRole("supervisor"), async (req, r
     if (err.message.includes("Not authorized")) {
       return res.status(403).json({ error: err.message });
     }
-    if (err.message.includes("Cannot delete")) {
+    if (err.message.includes("Can only edit")) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err.message.includes("Insufficient")) {
       return res.status(400).json({ error: err.message });
     }
     
-    res.status(500).json({ error: "Server error deleting assignment" });
+    res.status(500).json({ error: "Server error editing assignment" });
   } finally {
     session.endSession();
   }
@@ -750,25 +1144,33 @@ router.post("/assignments/:id/cancel", auth, requireRole("supervisor"), async (r
       throw new Error("Cannot cancel completed assignments");
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = getTodayDate();
 
-    const inventory = await SupervisorInventory.findOne({
-      supervisor: supervisorId,
-      date: today
-    }).session(session);
-
-    if (inventory) {
-      for (const assignedItem of assignment.inventory) {
-        const inventoryItem = inventory.items.find(
+    // Process inventory unlocks for each assigned item
+    for (const assignedItem of assignment.inventory) {
+      let targetInventory = null;
+      
+      if (assignedItem.source === "daily") {
+        targetInventory = await DailyInventory.findOne({
+          supervisor: supervisorId,
+          date: today
+        }).session(session);
+      } else if (assignedItem.source === "permanent") {
+        targetInventory = await PermanentInventory.findOne({
+          supervisor: supervisorId
+        }).session(session);
+      }
+      
+      if (targetInventory) {
+        const inventoryItem = targetInventory.items.find(
           item => String(item.foodItem) === String(assignedItem.foodItem)
         );
         
         if (inventoryItem) {
           inventoryItem.locked = Math.max(0, (inventoryItem.locked || 0) - assignedItem.quantityAssigned);
+          await targetInventory.save({ session });
         }
       }
-      await inventory.save({ session });
     }
 
     assignment.status = "cancelled";

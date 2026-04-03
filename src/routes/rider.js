@@ -155,6 +155,10 @@ router.get("/assignments/history", auth, requireRole("rider"), async (req, res) 
     .limit(limit)
     .populate("route", "name")
     .populate("vehicle", "registrationNo")
+    .populate({
+      path: "inventory.foodItem",
+      select: "price"
+    })
     .lean();
 
     const total = await DailyAssignment.countDocuments({
@@ -169,7 +173,10 @@ router.get("/assignments/history", auth, requireRole("rider"), async (req, res) 
       vehicleReg: a.vehicle?.registrationNo,
       totalItems: a.inventory?.reduce((sum, i) => sum + (i.quantityAssigned || 0), 0) || 0,
       totalSold: a.inventory?.reduce((sum, i) => sum + (i.quantitySold || 0), 0) || 0,
-      totalRevenue: a.inventory?.reduce((sum, i) => sum + ((i.quantitySold || 0) * (i.price || 0)), 0) || 0,
+      totalRevenue: a.inventory?.reduce((sum, i) => {
+        const price = i.foodItem?.price || 0;
+        return sum + ((i.quantitySold || 0) * price);
+      }, 0) || 0,
       startTime: a.startTime,
       endTime: a.endTime,
       duration: a.startTime && a.endTime ? Math.round((a.endTime - a.startTime) / 60000) : 0,
@@ -269,7 +276,7 @@ router.get("/assignments/:id", auth, requireRole("rider"), async (req, res) => {
 
 /**
  * POST /api/rider/assignments/:id/start
- * Start the assignment with location tracking
+ * Start the assignment - DOES NOT auto-mark first stop
  */
 router.post("/assignments/:id/start", auth, requireRole("rider"), async (req, res) => {
   try {
@@ -293,123 +300,164 @@ router.post("/assignments/:id/start", auth, requireRole("rider"), async (req, re
       });
     }
 
-    const { lat, lng } = req.body;
-    
+    // Check if there are stops
+    if (!assignment.stops || assignment.stops.length === 0) {
+      return res.status(400).json({ error: "No stops found for this assignment" });
+    }
+
+    // Start the assignment - DO NOT auto-mark first stop
     assignment.startTime = new Date();
     
-    // Record starting location if provided
-    if (lat && lng) {
-      assignment.currentLocation = { 
-        lat, 
-        lng, 
-        updatedAt: new Date() 
-      };
-    }
-    
-    if (assignment.stops && assignment.stops.length > 0) {
-      assignment.stops[0].status = "in-progress";
-      assignment.stops[0].arrivedAt = new Date();
-    }
+    // REMOVED: Auto-marking first stop as in-progress
+    // Rider must manually click "Arrive" for each stop including first
     
     await assignment.save();
 
     res.json({ 
       ok: true, 
-      message: "Assignment started successfully",
+      message: "Assignment started successfully. You can now arrive at stops manually.",
       startTime: assignment.startTime,
-      currentStop: assignment.stops[0] || null,
-      startLocation: assignment.currentLocation
+      totalStops: assignment.stops.length
     });
   } catch (err) {
     console.error("Start assignment error:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
 /**
  * POST /api/rider/sales
- * Rider records a sale with location and time tracking
+ * Rider records a sale (no location required)
  */
 router.post("/sales", auth, requireRole("rider"), async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const { assignmentId, foodItemId, qty, stopId, lat, lng } = req.body;
+    const { assignmentId, foodItemId, qty, stopId } = req.body;
+    const riderId = req.user.id;
 
-    const assignment = await DailyAssignment.findById(assignmentId).session(session);
+    console.log(`[Sales] Assignment: ${assignmentId}, Rider: ${riderId}, Food: ${foodItemId}, Qty: ${qty}`);
+
+    // Validate input
+    if (!assignmentId || !foodItemId || !qty || !stopId) {
+      await session.abortTransaction();
+      return res.status(400).json({ 
+        error: "Missing required fields: assignmentId, foodItemId, qty, stopId" 
+      });
+    }
+
+    if (qty <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ error: "Quantity must be greater than 0" });
+    }
+
+    // Find assignment and verify it belongs to the rider
+    const assignment = await DailyAssignment.findOne({
+      _id: assignmentId,
+      rider: riderId
+    })
+    .populate({
+      path: "inventory.foodItem",
+      select: "name price"
+    })
+    .session(session);
+
     if (!assignment) {
-      throw new Error("Assignment not found");
+      await session.abortTransaction();
+      return res.status(404).json({ error: "Assignment not found or not authorized" });
     }
 
-    const item = assignment.inventory.find(i => String(i.foodItem) === String(foodItemId));
-    if (!item) {
-      throw new Error("Food item not assigned to this assignment");
+    console.log(`[Sales] Assignment found: ${assignment._id}, Status: ${assignment.status}`);
+
+    // Check if assignment is active
+    if (assignment.status !== "active") {
+      await session.abortTransaction();
+      return res.status(400).json({ 
+        error: `Cannot record sales. Assignment status is ${assignment.status}, must be active` 
+      });
     }
+
+    // Validate stop
+    const stop = assignment.stops.find(s => String(s._id) === stopId);
+    if (!stop) {
+      await session.abortTransaction();
+      return res.status(404).json({ error: "Stop not found" });
+    }
+    
+    if (stop.status !== "in-progress") {
+      await session.abortTransaction();
+      return res.status(400).json({ 
+        error: `Cannot record sales. Stop status is ${stop.status}, must be in-progress` 
+      });
+    }
+
+    // Find the inventory item
+    const item = assignment.inventory.find(i => String(i.foodItem._id) === String(foodItemId));
+    if (!item) {
+      await session.abortTransaction();
+      return res.status(404).json({ error: "Food item not assigned to this assignment" });
+    }
+
+    console.log(`[Sales] Item found: ${item.foodItem?.name || 'Unknown'}, Remaining: ${item.quantityRemaining}`);
 
     if (item.quantityRemaining < qty) {
-      throw new Error(`Not enough stock. Only ${item.quantityRemaining} remaining`);
+      await session.abortTransaction();
+      return res.status(400).json({ 
+        error: `Not enough stock. Only ${item.quantityRemaining} remaining` 
+      });
     }
 
     // Update inventory
     item.quantitySold += qty;
     item.quantityRemaining -= qty;
 
-    let stop = null;
-    if (stopId) {
-      stop = assignment.stops.find(s => String(s._id) === stopId);
-      if (stop) {
-        if (!stop.sales) {
-          stop.sales = {
-            items: [],
-            totalRevenue: 0,
-            totalItems: 0
-          };
-        }
-
-        const existingSaleIndex = stop.sales.items.findIndex(
-          s => String(s.foodItemId) === String(foodItemId)
-        );
-
-        const food = await FoodItem.findById(foodItemId).session(session);
-        if (!food) {
-          throw new Error("Food item not found");
-        }
-        
-        if (existingSaleIndex >= 0) {
-          stop.sales.items[existingSaleIndex].quantity += qty;
-        } else {
-          stop.sales.items.push({
-            foodItemId,
-            name: food.name,
-            quantity: qty,
-            price: food.price
-          });
-        }
-
-        stop.sales.totalRevenue += food.price * qty;
-        stop.sales.totalItems += qty;
-      }
+    // Update stop sales
+    if (!stop.sales) {
+      stop.sales = {
+        items: [],
+        totalRevenue: 0,
+        totalItems: 0
+      };
     }
 
-    const food = await FoodItem.findById(foodItemId).session(session);
+    const food = item.foodItem;
     if (!food) {
-      throw new Error("Food item not found");
+      await session.abortTransaction();
+      return res.status(404).json({ error: "Food item not found" });
     }
+    
+    const existingSaleIndex = stop.sales.items.findIndex(
+      s => String(s.foodItemId) === String(foodItemId)
+    );
+    
+    if (existingSaleIndex >= 0) {
+      stop.sales.items[existingSaleIndex].quantity += qty;
+    } else {
+      stop.sales.items.push({
+        foodItemId,
+        name: food.name,
+        quantity: qty,
+        price: food.price
+      });
+    }
+
+    stop.sales.totalRevenue += food.price * qty;
+    stop.sales.totalItems += qty;
 
     const total = food.price * qty;
 
-    // Record the sale with location
+    // Record the sale - NO LOCATION REQUIRED
     const sale = new SalesTransaction({
       assignment: assignmentId,
-      rider: req.user.id,
+      rider: riderId,
       foodItem: foodItemId,
+      stopId: stopId,
+      stopName: stop.stopName,
       quantity: qty,
       price: food.price,
       total,
-      stopId: stopId || null,
-      location: lat && lng ? { lat, lng } : null,
-      timestamp: new Date()
+      soldAt: new Date()
     });
 
     await sale.save({ session });
@@ -417,26 +465,23 @@ router.post("/sales", auth, requireRole("rider"), async (req, res) => {
     assignment.totalSales = (assignment.totalSales || 0) + total;
     assignment.totalItemsSold = (assignment.totalItemsSold || 0) + qty;
     
-    // Update current location if provided
-    if (lat && lng) {
-      assignment.currentLocation = { lat, lng, updatedAt: new Date() };
-    }
-    
     await assignment.save({ session });
-
     await session.commitTransaction();
+
+    console.log(`[Sales] Sale recorded successfully. Total: ${total}`);
 
     res.json({
       ok: true,
+      message: "Sale recorded successfully",
       saleId: sale._id,
       total,
-      timestamp: sale.timestamp,
+      timestamp: sale.soldAt,
       updatedInventory: {
         foodItemId,
         quantityRemaining: item.quantityRemaining,
         quantitySold: item.quantitySold
       },
-      stopSales: stop ? stop.sales : null
+      stopSales: stop.sales
     });
 
   } catch (err) {
@@ -450,73 +495,18 @@ router.post("/sales", auth, requireRole("rider"), async (req, res) => {
 
 /**
  * POST /api/rider/stops/:stopId/arrive
- * Mark arrival at a stop with location
+ * Mark arrival at a stop (manual, no location required)
  */
 router.post("/stops/:stopId/arrive", auth, requireRole("rider"), async (req, res) => {
-  try {
-    const { stopId } = req.params;
-    const { assignmentId, lat, lng } = req.body;
+  const { stopId } = req.params;
+  const { assignmentId } = req.body;
 
-    const assignment = await DailyAssignment.findOne({
-      _id: assignmentId,
-      rider: req.user.id
-    });
-
-    if (!assignment) {
-      return res.status(404).json({ error: "Assignment not found" });
-    }
-
-    const stopIndex = assignment.stops.findIndex(s => String(s._id) === stopId);
-    if (stopIndex === -1) {
-      return res.status(404).json({ error: "Stop not found" });
-    }
-
-    if (stopIndex > 0) {
-      const previousStop = assignment.stops[stopIndex - 1];
-      if (previousStop.status === "in-progress") {
-        previousStop.status = "completed";
-        previousStop.completedAt = new Date();
-        if (previousStop.arrivedAt) {
-          previousStop.durationMinutes = Math.round(
-            (previousStop.completedAt - previousStop.arrivedAt) / 60000
-          );
-        }
-      }
-    }
-
-    assignment.stops[stopIndex].status = "in-progress";
-    assignment.stops[stopIndex].arrivedAt = new Date();
-    
-    // Record arrival location
-    if (lat && lng) {
-      assignment.currentLocation = { lat, lng, updatedAt: new Date() };
-    }
-
-    await assignment.save();
-
-    res.json({ 
-      ok: true,
-      stop: assignment.stops[stopIndex],
-      arrivalTime: assignment.stops[stopIndex].arrivedAt,
-      previousStop: stopIndex > 0 ? assignment.stops[stopIndex - 1] : null,
-      currentLocation: assignment.currentLocation
-    });
-
-  } catch (err) {
-    console.error("Stop arrival error:", err);
-    res.status(500).json({ error: "Server error" });
+  // Validate assignmentId
+  if (!assignmentId) {
+    return res.status(400).json({ error: "assignmentId is required" });
   }
-});
 
-/**
- * POST /api/rider/stops/:stopId/complete
- * Mark stop as complete with location
- */
-router.post("/stops/:stopId/complete", auth, requireRole("rider"), async (req, res) => {
   try {
-    const { stopId } = req.params;
-    const { assignmentId, lat, lng } = req.body;
-
     const assignment = await DailyAssignment.findOne({
       _id: assignmentId,
       rider: req.user.id
@@ -526,70 +516,83 @@ router.post("/stops/:stopId/complete", auth, requireRole("rider"), async (req, r
       return res.status(404).json({ error: "Assignment not found" });
     }
 
+    if (!assignment.stops || assignment.stops.length === 0) {
+      return res.status(400).json({ error: "No stops found in this assignment" });
+    }
+
+    // Check if assignment has started
+    if (!assignment.startTime) {
+      return res.status(400).json({ error: "Assignment has not been started yet. Please start the assignment first." });
+    }
+
+    // Find the stop
     const stopIndex = assignment.stops.findIndex(s => String(s._id) === stopId);
     if (stopIndex === -1) {
       return res.status(404).json({ error: "Stop not found" });
     }
 
     const stop = assignment.stops[stopIndex];
-    stop.status = "completed";
-    stop.completedAt = new Date();
 
-    if (stop.arrivedAt) {
-      stop.durationMinutes = Math.round((stop.completedAt - stop.arrivedAt) / 60000);
+    // Check current status
+    if (stop.status === "completed") {
+      return res.status(400).json({ error: "Stop is already completed" });
     }
 
-    const allStopsCompleted = assignment.stops.every(s => s.status === "completed");
-    if (allStopsCompleted) {
-      assignment.status = "completed";
-      assignment.endTime = new Date();
-    } else {
-      const nextStop = assignment.stops[stopIndex + 1];
-      if (nextStop && nextStop.status === "pending") {
-        nextStop.status = "in-progress";
-        nextStop.arrivedAt = new Date();
-      }
+    if (stop.status === "in-progress") {
+      return res.status(400).json({ error: "Stop is already in progress" });
     }
-    
-    // Record completion location
-    if (lat && lng) {
-      assignment.currentLocation = { lat, lng, updatedAt: new Date() };
+
+    // Check if this is the correct stop order
+    // Find the first non-completed stop
+    const firstNonCompletedIndex = assignment.stops.findIndex(s => s.status !== "completed");
+    if (firstNonCompletedIndex !== stopIndex) {
+      const nextStop = assignment.stops[firstNonCompletedIndex];
+      return res.status(400).json({ 
+        error: `Please complete stops in order. Next stop to visit: ${nextStop?.stopName || "Unknown"}`,
+        nextStopId: nextStop?._id,
+        nextStopName: nextStop?.stopName
+      });
     }
+
+    // Mark stop as arrived/in-progress
+    stop.status = "in-progress";
+    stop.arrivedAt = new Date();
 
     await assignment.save();
 
     res.json({ 
-      ok: true,
-      stop,
-      completionTime: stop.completedAt,
-      durationMinutes: stop.durationMinutes,
-      allStopsCompleted,
-      nextStop: assignment.stops[stopIndex + 1] || null,
-      progress: {
-        completed: assignment.stops.filter(s => s.status === "completed").length,
-        total: assignment.stops.length,
-        percentage: (assignment.stops.filter(s => s.status === "completed").length / assignment.stops.length) * 100
+      ok: true, 
+      message: `Arrived at ${stop.stopName} successfully`,
+      stop: {
+        _id: stop._id,
+        stopName: stop.stopName,
+        address: stop.address,
+        status: stop.status,
+        arrivedAt: stop.arrivedAt,
+        stopNumber: stopIndex + 1,
+        totalStops: assignment.stops.length
       }
     });
-
   } catch (err) {
-    console.error("Complete stop error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Error marking stop arrival:", err);
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
 /**
- * POST /api/rider/location
- * Update location in real-time with tracking history
+ * POST /api/rider/stops/:stopId/complete
+ * Mark stop as complete (manual, no location required)
  */
-router.post("/location", auth, requireRole("rider"), async (req, res) => {
-  try {
-    const { assignmentId, lat, lng } = req.body;
-    
-    if (!assignmentId || !lat || !lng) {
-      return res.status(400).json({ error: "Missing assignmentId, lat, or lng" });
-    }
+router.post("/stops/:stopId/complete", auth, requireRole("rider"), async (req, res) => {
+  const { stopId } = req.params;
+  const { assignmentId } = req.body;
 
+  // Validate assignmentId
+  if (!assignmentId) {
+    return res.status(400).json({ error: "assignmentId is required" });
+  }
+
+  try {
     const assignment = await DailyAssignment.findOne({
       _id: assignmentId,
       rider: req.user.id
@@ -599,68 +602,171 @@ router.post("/location", auth, requireRole("rider"), async (req, res) => {
       return res.status(404).json({ error: "Assignment not found" });
     }
 
-    // Initialize location history if not exists
-    if (!assignment.locationHistory) {
-      assignment.locationHistory = [];
+    if (!assignment.stops || assignment.stops.length === 0) {
+      return res.status(400).json({ error: "No stops found in this assignment" });
     }
-    
-    // Add to location history (keep last 100 locations)
-    assignment.locationHistory.push({
-      lat,
-      lng,
-      timestamp: new Date()
-    });
-    
-    if (assignment.locationHistory.length > 100) {
-      assignment.locationHistory.shift();
+
+    // Find the stop
+    const stopIndex = assignment.stops.findIndex(s => String(s._id) === stopId);
+    if (stopIndex === -1) {
+      return res.status(404).json({ error: "Stop not found" });
     }
-    
-    // Update current location
-    assignment.currentLocation = { 
-      lat, 
-      lng, 
-      updatedAt: new Date() 
-    };
+
+    const stop = assignment.stops[stopIndex];
+
+    // Check if stop is in progress
+    if (stop.status !== "in-progress") {
+      return res.status(400).json({ 
+        error: `Cannot complete stop. Current status: ${stop.status}. Stop must be 'in-progress' first.`,
+        currentStatus: stop.status
+      });
+    }
+
+    // Mark stop as completed
+    stop.status = "completed";
+    stop.completedAt = new Date();
+
+    // Calculate duration if arrivedAt exists
+    if (stop.arrivedAt) {
+      const durationMs = stop.completedAt - stop.arrivedAt;
+      stop.durationMinutes = Math.round(durationMs / 60000); // Convert to minutes
+    }
+
+    // Check if all stops are completed
+    const allStopsCompleted = assignment.stops.every(s => s.status === "completed");
+
+    // If all stops completed, mark assignment as completed
+    if (allStopsCompleted) {
+      assignment.status = "completed";
+      assignment.endTime = new Date();
+    }
 
     await assignment.save();
 
+    // Prepare response with next stop info if available
+    const nextStopIndex = stopIndex + 1;
+    const hasNextStop = nextStopIndex < assignment.stops.length;
+    const nextStop = hasNextStop ? assignment.stops[nextStopIndex] : null;
+
     res.json({ 
-      ok: true,
-      currentLocation: assignment.currentLocation,
-      lastUpdate: new Date()
+      ok: true, 
+      message: `Stop "${stop.stopName}" completed successfully`,
+      stop: {
+        _id: stop._id,
+        stopName: stop.stopName,
+        status: stop.status,
+        arrivedAt: stop.arrivedAt,
+        completedAt: stop.completedAt,
+        durationMinutes: stop.durationMinutes,
+        stopNumber: stopIndex + 1,
+        totalStops: assignment.stops.length
+      },
+      allStopsCompleted: allStopsCompleted,
+      assignmentStatus: assignment.status,
+      nextStop: nextStop ? {
+        _id: nextStop._id,
+        stopName: nextStop.stopName,
+        address: nextStop.address,
+        stopNumber: nextStopIndex + 1
+      } : null
     });
   } catch (err) {
-    console.error("Location update error:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Error completing stop:", err);
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
 /**
- * GET /api/rider/location/history/:assignmentId
- * Get location history for an assignment
+ * GET /api/rider/current-assignment
+ * Get current active assignment with full details
  */
-router.get("/location/history/:assignmentId", auth, requireRole("rider"), async (req, res) => {
+router.get("/current-assignment", auth, requireRole("rider"), async (req, res) => {
   try {
-    const { assignmentId } = req.params;
     const riderId = req.user.id;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
 
     const assignment = await DailyAssignment.findOne({
-      _id: assignmentId,
-      rider: riderId
+      rider: riderId,
+      date: { $gte: today, $lt: tomorrow },
+      status: { $in: ["pending", "active"] }
+    })
+    .populate("route", "name")
+    .populate("vehicle", "registrationNo type")
+    .populate("battery", "imei charge health")
+    .populate({
+      path: "inventory.foodItem",
+      select: "name price category imageUrl"
     });
 
     if (!assignment) {
-      return res.status(404).json({ error: "Assignment not found" });
+      return res.json({
+        ok: true,
+        hasActiveAssignment: false,
+        assignment: null,
+        message: "No active assignment found for today"
+      });
     }
+
+    // Get current stop info
+    const currentStopIndex = assignment.stops?.findIndex(s => s.status === "in-progress");
+    const currentStop = currentStopIndex >= 0 ? assignment.stops[currentStopIndex] : null;
+    
+    // Get next stop (first pending stop after current)
+    const nextStopIndex = currentStopIndex >= 0 
+      ? assignment.stops.findIndex((s, idx) => idx > currentStopIndex && s.status === "pending")
+      : assignment.stops?.findIndex(s => s.status === "pending");
+    const nextStop = nextStopIndex >= 0 ? assignment.stops[nextStopIndex] : null;
+
+    // Calculate progress
+    const stopsCompleted = assignment.stops?.filter(s => s.status === "completed").length || 0;
+    const totalStops = assignment.stops?.length || 0;
+    const progress = totalStops > 0 ? (stopsCompleted / totalStops) * 100 : 0;
 
     res.json({
       ok: true,
-      locationHistory: assignment.locationHistory || [],
-      currentLocation: assignment.currentLocation
+      hasActiveAssignment: true,
+      assignment: {
+        _id: assignment._id,
+        routeName: assignment.route?.name,
+        vehicle: assignment.vehicle,
+        battery: assignment.battery,
+        status: assignment.status,
+        startTime: assignment.startTime,
+        currentStop: currentStop ? {
+          _id: currentStop._id,
+          stopName: currentStop.stopName,
+          address: currentStop.address,
+          status: currentStop.status,
+          arrivedAt: currentStop.arrivedAt,
+          sales: currentStop.sales,
+          stopNumber: currentStopIndex + 1
+        } : null,
+        nextStop: nextStop ? {
+          _id: nextStop._id,
+          stopName: nextStop.stopName,
+          address: nextStop.address,
+          stopNumber: nextStopIndex + 1
+        } : null,
+        stopsCompleted: stopsCompleted,
+        totalStops: totalStops,
+        progress: Math.round(progress),
+        inventory: assignment.inventory.map(item => ({
+          foodItem: item.foodItem,
+          quantityAssigned: item.quantityAssigned,
+          quantityRemaining: item.quantityRemaining,
+          quantitySold: item.quantitySold
+        })),
+        totalSales: assignment.totalSales || 0,
+        totalItemsSold: assignment.totalItemsSold || 0
+      }
     });
 
   } catch (err) {
-    console.error("Get location history error:", err);
+    console.error("Get current assignment error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -681,6 +787,10 @@ router.get("/stats/today", auth, requireRole("rider"), async (req, res) => {
     const assignment = await DailyAssignment.findOne({
       rider: riderId,
       date: { $gte: today, $lt: tomorrow }
+    })
+    .populate({
+      path: "inventory.foodItem",
+      select: "name price"
     });
 
     if (!assignment) {
@@ -702,14 +812,20 @@ router.get("/stats/today", auth, requireRole("rider"), async (req, res) => {
 
     const totalItemsSold = assignment.inventory?.reduce((sum, i) => sum + (i.quantitySold || 0), 0) || 0;
     const totalSales = assignment.inventory?.reduce(
-      (sum, i) => sum + ((i.quantitySold || 0) * (i.price || 0)), 0
+      (sum, i) => sum + ((i.quantitySold || 0) * (i.foodItem?.price || 0)), 0
     ) || 0;
     const stopsCompleted = assignment.stops?.filter(s => s.status === 'completed').length || 0;
+    const totalStops = assignment.stops?.length || 0;
     
     // Calculate time-based stats
     const currentStop = assignment.stops?.find(s => s.status === 'in-progress');
     const currentStopDuration = currentStop?.arrivedAt ? 
       Math.round((new Date() - currentStop.arrivedAt) / 60000) : 0;
+
+    // Calculate average stop duration for completed stops
+    const completedStops = assignment.stops?.filter(s => s.status === 'completed') || [];
+    const averageStopDuration = completedStops.length > 0 ?
+      completedStops.reduce((sum, s) => sum + (s.durationMinutes || 0), 0) / completedStops.length : 0;
 
     res.json({
       ok: true,
@@ -718,26 +834,71 @@ router.get("/stats/today", auth, requireRole("rider"), async (req, res) => {
         totalSales,
         totalItemsSold,
         stopsCompleted,
-        totalStops: assignment.stops?.length || 0,
+        totalStops,
         status: assignment.status,
         startTime: assignment.startTime,
         endTime: assignment.endTime,
-        progress: assignment.stops?.length > 0 
-          ? (stopsCompleted / assignment.stops.length) * 100 
-          : 0,
+        progress: totalStops > 0 ? (stopsCompleted / totalStops) * 100 : 0,
         currentStop: currentStop ? {
+          id: currentStop._id,
           name: currentStop.stopName,
           duration: currentStopDuration,
           arrivedAt: currentStop.arrivedAt
         } : null,
-        averageStopDuration: stopsCompleted > 0 ? 
-          assignment.stops.filter(s => s.status === 'completed')
-            .reduce((sum, s) => sum + (s.durationMinutes || 0), 0) / stopsCompleted : 0
+        averageStopDuration: Math.round(averageStopDuration),
+        remainingInventory: assignment.inventory?.reduce((sum, i) => sum + (i.quantityRemaining || 0), 0) || 0
       }
     });
 
   } catch (err) {
     console.error("Get rider stats error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * GET /api/rider/available-items/:assignmentId
+ * Get available food items for current assignment
+ */
+router.get("/available-items/:assignmentId", auth, requireRole("rider"), async (req, res) => {
+  try {
+    const { assignmentId } = req.params;
+    const riderId = req.user.id;
+
+    const assignment = await DailyAssignment.findOne({
+      _id: assignmentId,
+      rider: riderId
+    })
+    .populate({
+      path: "inventory.foodItem",
+      select: "name price category imageUrl description"
+    });
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    const availableItems = assignment.inventory
+      .filter(item => item.quantityRemaining > 0)
+      .map(item => ({
+        id: item.foodItem._id,
+        name: item.foodItem.name,
+        price: item.foodItem.price,
+        category: item.foodItem.category,
+        imageUrl: item.foodItem.imageUrl,
+        description: item.foodItem.description,
+        quantityRemaining: item.quantityRemaining,
+        quantitySold: item.quantitySold
+      }));
+
+    res.json({
+      ok: true,
+      items: availableItems,
+      totalItems: availableItems.length
+    });
+
+  } catch (err) {
+    console.error("Get available items error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
